@@ -472,6 +472,9 @@ class Scheduler:
         # Sequence groups in the SWAPPED state.
         # Contain decode requests that are swapped out.
         self.swapped: Deque[SequenceGroup] = deque()
+        # Sequence groups in the head of waiting
+        # Contain next batch requests
+        self.ready: Deque[SequenceGroup] = deque()
         # Sequence groups finished requests ids since last step iteration.
         # It lets the model know that any state associated with these requests
         # can and must be released after the current step.
@@ -921,6 +924,14 @@ class Scheduler:
             infeasible_seq_groups=infeasible_seq_groups,
         )
 
+    def _schedule_ready(self, prefetch_num):
+        self.ready.clear()
+        if len(self.waiting) > prefetch_num:
+            for i in range(prefetch_num):
+                self.ready.append(self.waiting[i])
+        else:
+            self.ready.extend(self.waiting)
+
     def _get_prompt_limit(self, seq_group: SequenceGroup) -> int:
         if (self.scheduler_config.chunked_prefill_enabled
                 and not self.scheduler_config.is_multi_step):
@@ -1278,6 +1289,11 @@ class Scheduler:
         assert len(running_scheduled.prefill_seq_groups) == 0
         assert len(swapped_in.prefill_seq_groups) == 0
 
+        # Update ready queue
+        prefetch = True
+        if prefetch:
+            _schedule_ready()
+
         # Merge lists
         num_prefill_groups = len(prefills.seq_groups)
         if num_prefill_groups > 0:
@@ -1604,6 +1620,16 @@ class Scheduler:
             if allow_async_output_proc:
                 allow_async_output_proc = self._allow_async_output_proc(
                     seq_group)
+        
+        next_group_metadata_list: List[NextGroupMetadata] = []
+        for seq in self.ready:
+            next_group_metadata = NextGroupMetadata(
+                request_id=seq.request_id,
+                next_lora_requests=seq.lora_request
+            )
+            next_group_metadata_list.append(next_group_metadata)
+        if len(next_group_metadata_list) == 0:
+            next_group_metadata_list = None
 
         # Now that the batch has been created, we can assume all blocks in the
         # batch will have been computed before the next scheduling invocation.
@@ -1632,7 +1658,7 @@ class Scheduler:
 
         # Return results
         return (seq_group_metadata_list, scheduler_outputs,
-                allow_async_output_proc)
+                allow_async_output_proc, next_group_metadata_list)
 
     def fork_seq(self, parent_seq: Sequence, child_seq: Sequence) -> None:
         self.block_manager.fork(parent_seq, child_seq)

@@ -887,6 +887,15 @@ class SequenceGroup:
                 f"num_seqs={len(self.seqs)})")
 
 
+class NextGroupMetadata(
+        msgspec.Struct,
+        tag=True,  # type: ignore[call-arg]
+        array_like=True,  # type: ignore[call-arg]
+        omit_defaults=True):  # type: ignore[call-arg]
+    
+    request_id: str
+    next_lora_requests: LoRARequest
+
 class SequenceGroupMetadataDelta(
         msgspec.Struct,
         tag=True,  # type: ignore[call-arg]
@@ -1315,6 +1324,8 @@ class ExecuteModelRequest(
     last_sampled_token_ids: Optional[torch.Tensor] = None
     # Async callback
     async_callback: Optional[Callable] = None
+    # Next batch sequence group metadata list.
+    next_group_metadata_list: Optional[List[NextGroupMetadata]] = None
 
     @property
     def is_first_multi_step(self) -> bool:

@@ -47,7 +47,7 @@ from vllm.prompt_adapter.request import PromptAdapterRequest
 from vllm.prompt_adapter.worker_manager import (
     LRUCacheWorkerPromptAdapterManager)
 from vllm.sampling_params import SamplingParams
-from vllm.sequence import IntermediateTensors, SequenceGroupMetadata
+from vllm.sequence import IntermediateTensors, SequenceGroupMetadata, NextGroupMetadata
 from vllm.utils import (DeviceMemoryProfiler, GiB_bytes, PyObjectCache,
                         async_tensor_h2d, flatten_2d_lists,
                         is_pin_memory_available, supports_dynamo,
@@ -90,6 +90,7 @@ class ModelInputForGPU(ModelRunnerInputBase):
     query_lens: Optional[List[int]] = None
     lora_mapping: Optional["LoRAMapping"] = None
     lora_requests: Optional[Set[LoRARequest]] = None
+    next_lora_requests: Optional[Set[LoRARequest]] = None
     attn_metadata: Optional["AttentionMetadata"] = None
     prompt_adapter_mapping: Optional[PromptAdapterMapping] = None
     prompt_adapter_requests: Optional[Set[PromptAdapterRequest]] = None
@@ -107,6 +108,7 @@ class ModelInputForGPU(ModelRunnerInputBase):
             "input_positions": self.input_positions,
             "lora_requests": self.lora_requests,
             "lora_mapping": self.lora_mapping,
+            "next_lora_requests": self.next_lora_requests,
             "multi_modal_kwargs": self.multi_modal_kwargs,
             "prompt_adapter_mapping": self.prompt_adapter_mapping,
             "prompt_adapter_requests": self.prompt_adapter_requests,
@@ -157,6 +159,7 @@ class ModelInputForGPUWithSamplingMetadata(ModelInputForGPU):
             "input_positions": self.input_positions,
             "lora_requests": self.lora_requests,
             "lora_mapping": self.lora_mapping,
+            "next_lora_requests": self.next_lora_requests,
             "multi_modal_kwargs": self.multi_modal_kwargs,
             "prompt_adapter_mapping": self.prompt_adapter_mapping,
             "prompt_adapter_requests": self.prompt_adapter_requests,
@@ -399,6 +402,20 @@ class ModelInputForGPUBuilder(ModelRunnerInputBuilderBase[ModelInputForGPU]):
 
             self.lora_index_mapping = []
             self.lora_prompt_mapping = []
+    
+    class NextDataForSeqGroup:
+        """Next data for the next batch sequence group."""
+
+        def __init__(
+            self,
+            *,
+            # From sequence group metadata.
+            request_id: str,
+            # LoRA inputs.
+            next_lora_requests: Optional[Set[LoRARequest]] = None,
+        ):
+            self.request_id = request_id
+            self.next_lora_requests = next_lora_requests or set()
 
     def gen_inter_data_builder(self, num_seqs: int):
         return lambda: ModelInputForGPUBuilder.InterDataForSeqGroup(
@@ -486,6 +503,9 @@ class ModelInputForGPUBuilder(ModelRunnerInputBuilderBase[ModelInputForGPU]):
         # the current sequence group.
         self.inter_data_list: List[
             ModelInputForGPUBuilder.InterDataForSeqGroup] = []
+        
+        # Next data for the next batch sequence group
+        self.next_data_list: List[ModelInputForGPUBuilder.NextDataForSeqGroup] = []
 
         self.attn_metadata_builder.prepare()
 
@@ -725,6 +745,13 @@ class ModelInputForGPUBuilder(ModelRunnerInputBuilderBase[ModelInputForGPU]):
                 seq_data.mrope_position_delta = mrope_position_delta
                 inter_data.mrope_input_positions[
                     seq_idx] = mrope_input_positions
+    
+    def add_next_seq_group(self, next_group_metadata: NextGroupMetadata):
+        """Add a next sequence group to the builder."""
+        next_data = NextDataForSeqGroup(
+            request_id=next_group_metadata.request_id,
+            next_lora_requests=next_group_metadata.next_lora_requests)
+        self.next_data_list.append(next_data)
 
     def add_seq_group(self, seq_group_metadata: SequenceGroupMetadata):
         """Add a sequence group to the builder."""
@@ -928,6 +955,7 @@ class ModelInputForGPUBuilder(ModelRunnerInputBuilderBase[ModelInputForGPU]):
         # LoRA data.
         lora_requests = set()
         lora_mapping = None
+        next_lora_requests = set()
         if self.enable_lora:
             lora_requests = set(r for data in self.inter_data_list
                                 for r in data.lora_requests)
@@ -947,6 +975,9 @@ class ModelInputForGPUBuilder(ModelRunnerInputBuilderBase[ModelInputForGPU]):
                 **dict(index_mapping=lora_index_mapping,
                        prompt_mapping=lora_prompt_mapping,
                        is_prefill=not self.decode_only))
+            
+            next_lora_requests = set(r for data in self.next_data_list
+                                     for r in data.next_lora_requests)
 
         # Prompt adapter data.
         prompt_adapter_requests: Set[PromptAdapterRequest] = set()
@@ -987,6 +1018,7 @@ class ModelInputForGPUBuilder(ModelRunnerInputBuilderBase[ModelInputForGPU]):
             query_lens=query_lens,
             lora_mapping=lora_mapping,
             lora_requests=lora_requests,
+            next_lora_requests=next_lora_requests,
             multi_modal_kwargs=multi_modal_kwargs,
             request_ids_to_seq_ids=request_ids_to_seq_ids,
             finished_requests_ids=self.finished_requests_ids,
@@ -1198,6 +1230,7 @@ class GPUModelRunnerBase(ModelRunnerBase[TModelInputForGPU]):
     def _prepare_model_input_tensors(
         self,
         seq_group_metadata_list: List[SequenceGroupMetadata],
+        next_group_metadata_list: Optional[List[NextGroupMetadata]],
         finished_requests_ids: Optional[List[str]] = None
     ) -> TModelInputForGPU:
         """Helper method to prepare the model input based on a given sequence
@@ -1217,6 +1250,8 @@ class GPUModelRunnerBase(ModelRunnerBase[TModelInputForGPU]):
         self.builder.prepare(finished_requests_ids)
         for seq_group_metadata in seq_group_metadata_list:
             self.builder.add_seq_group(seq_group_metadata)
+        for next_group_metadata in next_group_metadata_list:
+            self.builder.add_next_seq_group(next_group_metadata)
 
         self.builder.reset_cached_inter_data()
 
@@ -1613,6 +1648,7 @@ class ModelRunner(GPUModelRunnerBase[ModelInputForGPUWithSamplingMetadata]):
         self,
         seq_group_metadata_list: List[SequenceGroupMetadata],
         virtual_engine: int = 0,
+        next_group_metadata_list: Optional[List[NextGroupMetadata]],
         finished_requests_ids: Optional[List[str]] = None,
     ) -> ModelInputForGPUWithSamplingMetadata:
         """Prepare the model input based on a given sequence group, including
@@ -1629,7 +1665,7 @@ class ModelRunner(GPUModelRunnerBase[ModelInputForGPUWithSamplingMetadata]):
         If cuda graph is required, this API automatically pads inputs.
         """
         model_input = self._prepare_model_input_tensors(
-            seq_group_metadata_list, finished_requests_ids)
+            seq_group_metadata_list, next_group_metadata_list, finished_requests_ids)
         if get_pp_group().is_last_rank:
             # Sampling metadata is only required for the final pp group
             generators = self.get_generators(finished_requests_ids)
