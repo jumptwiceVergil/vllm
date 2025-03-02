@@ -1292,7 +1292,7 @@ class Scheduler:
         # Update ready queue
         prefetch = True
         if prefetch:
-            _schedule_ready()
+            self._schedule_ready()
 
         # Merge lists
         num_prefill_groups = len(prefills.seq_groups)

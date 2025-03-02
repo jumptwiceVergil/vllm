@@ -6,6 +6,7 @@ On the server side, run one of the following commands:
     vllm serve <your_model> \
         --swap-space 16 \
         --disable-log-requests
+        --enable-lora
 
     (TGI backend)
     ./launch_tgi_server.sh <your_model> <max_batch_total_tokens>
@@ -34,6 +35,9 @@ import os
 import random
 import time
 import warnings
+import aiohttp
+import sys
+import traceback
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, AsyncGenerator, Collection, Dict, List, Optional, Tuple
@@ -96,38 +100,43 @@ async def load_lora_adapters(adapter_num: int) -> List[str]:
     AIOHTTP_TIMEOUT = aiohttp.ClientTimeout(total=6 * 60 * 60)
 
     # download the adapter
-    lora_path = snapshot_download(repo_id="")
+    lora_path = "/home/jiangwentao/.cache/huggingface/hub/models--yard1--llama-2-7b-sql-lora-test/snapshots/0dfa347e8877a4d4ed19ee56c140fa518470028c" #snapshot_download(repo_id="")
     url = f"http://localhost:8000/v1/load_lora_adapter"
 
     # load lora adapter
-    pbar = tqdm(total=len(adapter_num))
+    pbar = tqdm(total=adapter_num)
     lora_adapters: List[str] = []
     for adapter_id in range(adapter_num):
         async with aiohttp.ClientSession(trust_env=True,
                                      timeout=AIOHTTP_TIMEOUT) as session:
-        payload = {
-            "lora_name": f"adapter-{adapter_id}",
-            "lora_path": f"{lora_path}"
-        }
-        headers = {
-            "Content-Type": f"application/json"
-        }
-
-        try:
-            async with session.post(url=url, json=payload,
-                                    headers=headers) as response:
-                if response.status == 200:
-                    lora_adapters.append(f"adapter-{adapter_id}")
-                    success = True
-                else:
-                    error = response.reason or ""
-                    success = False
-        except Exception:
+            adapter_name: str = f"adapter-{adapter_id}"
+            payload = {
+                "lora_name": f"{adapter_name}",
+                "lora_path": f"{lora_path}"
+            }
+            headers = {
+                "Content-Type": "application/json"
+            }
             success = False
-            error = "".join(traceback.format_exception(*exc_info))
-        
-        assert success==True
-        pbar.update(1)
+            try:
+                async with session.post(url=url, json=payload,
+                                        headers=headers) as response:
+                    if response.status == 200:
+                        lora_adapters.append(adapter_name)
+                        success = True
+                    else:
+                        success = False
+                        error=response.reason or ""
+                        raise ValueError(
+                            f"Error: {error}")
+            except Exception:
+                success = False
+                exc_info = sys.exc_info()
+                error = "".join(traceback.format_exception(*exc_info))
+                raise ValueError(
+                    f"Error: {error}")
+            assert success==True
+            pbar.update(1)
     if pbar is not None:
         pbar.close()
     return lora_adapters
@@ -139,27 +148,25 @@ async def unload_lora_adapter(adapter_name: str, pbar: Optional[tqdm] = None):
     # unload lora adapter
     async with aiohttp.ClientSession(trust_env=True,
                                     timeout=AIOHTTP_TIMEOUT) as session:
-    payload = {
-        "lora_name": adapter_name
-    }
-    headers = {
-        "Content-Type": f"application/json"
-    }
-
-    try:
-        async with session.post(url=url, json=payload,
-                                headers=headers) as response:
-            if response.status == 200:
-                success = True
-            else:
-                error = response.reason or ""
-                success = False
-    except Exception:
+        payload = {
+            "lora_name": f"{adapter_name}"
+        }
+        headers = {
+            "Content-Type": "application/json"
+        }
         success = False
-        error = "".join(traceback.format_exception(*exc_info))
-    
-    assert success==True
-    pbar.update(1)
+        try:
+            async with session.post(url=url, json=payload,
+                                    headers=headers) as response:
+                if response.status == 200:
+                    success = True
+                else:
+                    success = False
+        except Exception:
+            success = False
+        
+        assert success==True
+        pbar.update(1)
 
 
 def sample_sharegpt_requests(
@@ -644,7 +651,7 @@ async def benchmark(
     adapter_num: Optional[int],
 ):
     if adapter_num:
-        lora_adapters_list = load_lora_adapters(adapter_num)
+        lora_adapters_list = await load_lora_adapters(adapter_num)
     if backend in ASYNC_REQUEST_FUNCS:
         request_func = ASYNC_REQUEST_FUNCS[backend]
     else:
@@ -778,7 +785,8 @@ async def benchmark(
 
     if adapter_num:
         pbar_lora = None if disable_tqdm else tqdm(total=adapter_num)
-        unload_lora_adapter(adapter_name, pbar_lora) for adapter_name in lora_adapters_list
+        for adapter_name in lora_adapters_list:
+            await unload_lora_adapter(adapter_name, pbar_lora) 
         if pbar_lora is not None:
             pbar_lora.close()
 

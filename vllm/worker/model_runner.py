@@ -748,7 +748,7 @@ class ModelInputForGPUBuilder(ModelRunnerInputBuilderBase[ModelInputForGPU]):
     
     def add_next_seq_group(self, next_group_metadata: NextGroupMetadata):
         """Add a next sequence group to the builder."""
-        next_data = NextDataForSeqGroup(
+        next_data = ModelInputForGPUBuilder.NextDataForSeqGroup(
             request_id=next_group_metadata.request_id,
             next_lora_requests=next_group_metadata.next_lora_requests)
         self.next_data_list.append(next_data)
@@ -1230,7 +1230,7 @@ class GPUModelRunnerBase(ModelRunnerBase[TModelInputForGPU]):
     def _prepare_model_input_tensors(
         self,
         seq_group_metadata_list: List[SequenceGroupMetadata],
-        next_group_metadata_list: Optional[List[NextGroupMetadata]],
+        next_group_metadata_list: Optional[List[NextGroupMetadata]] = None,
         finished_requests_ids: Optional[List[str]] = None
     ) -> TModelInputForGPU:
         """Helper method to prepare the model input based on a given sequence
@@ -1250,9 +1250,10 @@ class GPUModelRunnerBase(ModelRunnerBase[TModelInputForGPU]):
         self.builder.prepare(finished_requests_ids)
         for seq_group_metadata in seq_group_metadata_list:
             self.builder.add_seq_group(seq_group_metadata)
-        for next_group_metadata in next_group_metadata_list:
-            self.builder.add_next_seq_group(next_group_metadata)
-
+        if next_group_metadata_list is not None:
+            for next_group_metadata in next_group_metadata_list:
+                self.builder.add_next_seq_group(next_group_metadata) 
+        
         self.builder.reset_cached_inter_data()
 
         return self.builder.build()  # type: ignore
@@ -1648,7 +1649,7 @@ class ModelRunner(GPUModelRunnerBase[ModelInputForGPUWithSamplingMetadata]):
         self,
         seq_group_metadata_list: List[SequenceGroupMetadata],
         virtual_engine: int = 0,
-        next_group_metadata_list: Optional[List[NextGroupMetadata]],
+        next_group_metadata_list: Optional[List[NextGroupMetadata]] = None,
         finished_requests_ids: Optional[List[str]] = None,
     ) -> ModelInputForGPUWithSamplingMetadata:
         """Prepare the model input based on a given sequence group, including
