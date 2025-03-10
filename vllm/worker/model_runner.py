@@ -412,10 +412,10 @@ class ModelInputForGPUBuilder(ModelRunnerInputBuilderBase[ModelInputForGPU]):
             # From sequence group metadata.
             request_id: str,
             # LoRA inputs.
-            next_lora_requests: Optional[Set[LoRARequest]] = None,
+            next_lora_request: Optional[LoRARequest] = None,
         ):
             self.request_id = request_id
-            self.next_lora_requests = next_lora_requests or set()
+            self.next_lora_request = next_lora_request or None
 
     def gen_inter_data_builder(self, num_seqs: int):
         return lambda: ModelInputForGPUBuilder.InterDataForSeqGroup(
@@ -750,7 +750,7 @@ class ModelInputForGPUBuilder(ModelRunnerInputBuilderBase[ModelInputForGPU]):
         """Add a next sequence group to the builder."""
         next_data = ModelInputForGPUBuilder.NextDataForSeqGroup(
             request_id=next_group_metadata.request_id,
-            next_lora_requests=next_group_metadata.next_lora_requests)
+            next_lora_request=next_group_metadata.next_lora_request)
         self.next_data_list.append(next_data)
 
     def add_seq_group(self, seq_group_metadata: SequenceGroupMetadata):
@@ -976,8 +976,8 @@ class ModelInputForGPUBuilder(ModelRunnerInputBuilderBase[ModelInputForGPU]):
                        prompt_mapping=lora_prompt_mapping,
                        is_prefill=not self.decode_only))
             
-            next_lora_requests = set(r for data in self.next_data_list
-                                     for r in data.next_lora_requests)
+            if len(self.next_data_list) > 0:
+                next_lora_requests = set(data.next_lora_request for data in self.next_data_list if data.next_lora_request is not None)
 
         # Prompt adapter data.
         prompt_adapter_requests: Set[PromptAdapterRequest] = set()
@@ -1633,6 +1633,7 @@ class ModelRunner(GPUModelRunnerBase[ModelInputForGPUWithSamplingMetadata]):
     _model_input_cls: Type[ModelInputForGPUWithSamplingMetadata] = (
         ModelInputForGPUWithSamplingMetadata)
     _builder_cls: Type[ModelInputForGPUBuilder] = ModelInputForGPUBuilder
+    adapter_id: int = 0
 
     def make_model_input_from_broadcasted_tensor_dict(
         self,
@@ -1683,6 +1684,12 @@ class ModelRunner(GPUModelRunnerBase[ModelInputForGPUWithSamplingMetadata]):
                                    is_prompt=is_prompt,
                                    virtual_engine=virtual_engine)
 
+    def load_lora(self,
+                  next_lora_list: List[LoRARequest]):
+        if (self.lora_config and next_lora_list is not None):
+            for i in range(len(next_lora_list)):
+                self.add_lora(next_lora_list[i])
+
     @torch.inference_mode()
     def execute_model(
         self,
@@ -1717,13 +1724,26 @@ class ModelRunner(GPUModelRunnerBase[ModelInputForGPUWithSamplingMetadata]):
         # TODO(andoorve): We can remove this once all
         # virtual engines share the same kv cache.
         virtual_engine = model_input.virtual_engine
+        stream_2 = torch.cuda.Stream()
         if prefill_meta is None and decode_meta.use_cuda_graph:
             assert model_input.input_tokens is not None
             graph_batch_size = model_input.input_tokens.shape[0]
             model_executable = self.graph_runners[virtual_engine][
                 graph_batch_size]
+            next_lora_list = list(model_input.next_lora_requests) if model_input.next_lora_requests is not None else None
+            # if (self.lora_config and next_lora_list is not None
+            #     and self.adapter_id < len(next_lora_list)
+            #     and self.adapter_id < (self.lora_config.max_loras/2)):
+            #     print(f"prefetching {next_lora_list[self.adapter_id]}...")
+            #     print(f"the first adapter is {next_lora_list[0]}...")
+            #     self.add_lora(next_lora_list[self.adapter_id])
+            #     self.adapter_id += 1
+            with torch.cuda.stream(stream_2):
+                self.load_lora(next_lora_list)
+            torch.cuda.synchronize(stream_2)
         else:
             model_executable = self.model
+            self.adapter_id = 0
 
         # Receive KV cache in distributed KV cache transfer setting
         # In disagg prefill setting, it will also recv hidden states and bypass

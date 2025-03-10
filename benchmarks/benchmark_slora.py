@@ -5,8 +5,10 @@ On the server side, run one of the following commands:
     vLLM OpenAI API server
     vllm serve <your_model> \
         --swap-space 16 \
-        --disable-log-requests
-        --enable-lora
+        --disable-log-requests \
+        --enable-lora \
+        --max-loras 8 \
+        --max-cpu-loras 8
 
     (TGI backend)
     ./launch_tgi_server.sh <your_model> <max_batch_total_tokens>
@@ -100,8 +102,8 @@ async def load_lora_adapters(adapter_num: int) -> List[str]:
     AIOHTTP_TIMEOUT = aiohttp.ClientTimeout(total=6 * 60 * 60)
 
     # download the adapter
-    lora_path = "/home/jiangwentao/.cache/huggingface/hub/models--yard1--llama-2-7b-sql-lora-test/snapshots/0dfa347e8877a4d4ed19ee56c140fa518470028c" #snapshot_download(repo_id="")
-    url = f"http://localhost:8000/v1/load_lora_adapter"
+    lora_path = "/home/jiangwentao/.cache/huggingface/hub/models--fortymiles--Llama-3-8B-sft-lora-ultrachat/snapshots/773859869640f5e88d2035405d14b6ed5a36e993"# snapshot_download(repo_id="fortymiles/Llama-3-8B-sft-lora-ultrachat")
+    url = "http://localhost:8000/v1/load_lora_adapter"
 
     # load lora adapter
     pbar = tqdm(total=adapter_num)
@@ -127,14 +129,12 @@ async def load_lora_adapters(adapter_num: int) -> List[str]:
                     else:
                         success = False
                         error=response.reason or ""
-                        raise ValueError(
-                            f"Error: {error}")
+                        raise ValueError(f"Error: {error}")
             except Exception:
                 success = False
                 exc_info = sys.exc_info()
                 error = "".join(traceback.format_exception(*exc_info))
-                raise ValueError(
-                    f"Error: {error}")
+                raise ValueError(f"Error: {error}")
             assert success==True
             pbar.update(1)
     if pbar is not None:
@@ -162,8 +162,13 @@ async def unload_lora_adapter(adapter_name: str, pbar: Optional[tqdm] = None):
                     success = True
                 else:
                     success = False
+                    error=response.reason or ""
+                    raise ValueError(f"Error: {error}")
         except Exception:
             success = False
+            exc_info = sys.exc_info()
+            error = "".join(traceback.format_exception(*exc_info))
+            raise ValueError(f"Error: {error}")
         
         assert success==True
         pbar.update(1)
@@ -664,8 +669,12 @@ async def benchmark(
         # multi-modal benchmark is only available on OpenAI Chat backend.
         raise ValueError(
             "Multi-modal content is only supported on 'openai-chat' backend.")
+    if adapter_num:
+        test_model_id = lora_adapters_list[0]
+    else:
+        test_model_id = model_id
     test_input = RequestFuncInput(
-        model=model_id,
+        model=test_model_id,
         model_name=model_name,
         prompt=test_prompt,
         api_url=api_url,
@@ -689,9 +698,9 @@ async def benchmark(
         # For each input request, choose a LoRA module at random.
         lora_modules = iter(
             [random.choice(lora_modules) for _ in range(len(input_requests))])
-    if adapter_num:
-        lora_adapters = iter(
-            [random.choice(lora_adapters_list) for _ in range(len(input_requests))])
+    # if adapter_num:
+    #     lora_adapters = iter(
+    #         [random.choice(lora_adapters_list) for _ in range(len(input_requests))])
 
     if profile:
         print("Starting profiler...")
@@ -737,6 +746,7 @@ async def benchmark(
 
     benchmark_start_time = time.perf_counter()
     tasks: List[asyncio.Task] = []
+    id = 0
     async for request in get_request(input_requests, request_rate, burstiness):
         prompt, prompt_len, output_len, mm_content = request
         req_model_id, req_model_name = model_id, model_name
@@ -744,8 +754,10 @@ async def benchmark(
             req_lora_module = next(lora_modules)
             req_model_id, req_model_name = req_lora_module, req_lora_module
         if adapter_num:
-            req_lora_adapter = next(lora_adapters)
-            req_model_id, req_model_name = req_lora_adapter, req_lora_adapter
+            # req_lora_adapter = next(lora_adapters)
+            # req_model_id, req_model_name = req_lora_adapter, req_lora_adapter
+            req_model_id, req_model_name = lora_adapters_list[id], lora_adapters_list[id]
+            id = (id + 1) % adapter_num
 
         request_func_input = RequestFuncInput(model=req_model_id,
                                               model_name=req_model_name,

@@ -894,7 +894,7 @@ class NextGroupMetadata(
         omit_defaults=True):  # type: ignore[call-arg]
     
     request_id: str
-    next_lora_requests: LoRARequest
+    next_lora_request: Optional[LoRARequest] = None
 
 class SequenceGroupMetadataDelta(
         msgspec.Struct,

@@ -198,6 +198,7 @@ hip_compat.h
 
 # Benchmark dataset
 benchmarks/*.json
+nsys-profile/
 
 # Linting
 actionlint

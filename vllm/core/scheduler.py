@@ -16,7 +16,7 @@ from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
 from vllm.prompt_adapter.request import PromptAdapterRequest
 from vllm.sequence import (Sequence, SequenceData, SequenceGroup,
-                           SequenceGroupMetadata, SequenceGroupMetadataDelta,
+                           SequenceGroupMetadata, SequenceGroupMetadataDelta, NextGroupMetadata,
                            SequenceStage, SequenceStatus)
 from vllm.utils import Device, PyObjectCache
 
@@ -869,7 +869,7 @@ class Scheduler:
                 assert curr_loras is not None
                 assert self.lora_config is not None
                 if (lora_int_id > 0 and (lora_int_id not in curr_loras)
-                        and len(curr_loras) >= self.lora_config.max_loras):
+                        and len(curr_loras) >= self.lora_config.max_loras/2):
                     # We don't have a space for another LoRA, so
                     # we ignore this request for now.
                     leftover_swapped.appendleft(seq_group)
@@ -1141,7 +1141,7 @@ class Scheduler:
                 assert self.lora_config is not None
                 if (self.lora_enabled and lora_int_id > 0
                         and lora_int_id not in curr_loras
-                        and len(curr_loras) >= self.lora_config.max_loras):
+                        and len(curr_loras) >= self.lora_config.max_loras/2):
                     # We don't have a space for another LoRA, so
                     # we ignore this request for now.
                     leftover_waiting_sequences.appendleft(seq_group)
@@ -1292,7 +1292,7 @@ class Scheduler:
         # Update ready queue
         prefetch = True
         if prefetch:
-            self._schedule_ready()
+            self._schedule_ready(int(self.lora_config.max_loras/2))
 
         # Merge lists
         num_prefill_groups = len(prefills.seq_groups)
@@ -1625,7 +1625,7 @@ class Scheduler:
         for seq in self.ready:
             next_group_metadata = NextGroupMetadata(
                 request_id=seq.request_id,
-                next_lora_requests=seq.lora_request
+                next_lora_request=seq.lora_request
             )
             next_group_metadata_list.append(next_group_metadata)
         if len(next_group_metadata_list) == 0:
