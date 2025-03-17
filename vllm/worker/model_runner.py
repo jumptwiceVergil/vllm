@@ -976,8 +976,12 @@ class ModelInputForGPUBuilder(ModelRunnerInputBuilderBase[ModelInputForGPU]):
                        prompt_mapping=lora_prompt_mapping,
                        is_prefill=not self.decode_only))
             
-            if len(self.next_data_list) > 0:
-                next_lora_requests = set(data.next_lora_request for data in self.next_data_list if data.next_lora_request is not None)
+        if len(self.next_data_list) > 0:
+            next_lora_requests = set(data.next_lora_request 
+                                        for data in self.next_data_list 
+                                        if data.next_lora_request is not None)
+        else:
+            next_lora_requests = None
 
         # Prompt adapter data.
         prompt_adapter_requests: Set[PromptAdapterRequest] = set()
@@ -1290,7 +1294,7 @@ class GPUModelRunnerBase(ModelRunnerBase[TModelInputForGPU]):
             if self.lora_config:
                 assert self.lora_manager is not None
                 with self.lora_manager.dummy_lora_cache():
-                    for idx in range(self.lora_config.max_loras):
+                    for idx in range(self.lora_config.max_loras - self.lora_config.prefetch_num):
                         lora_id = idx + 1
                         dummy_lora_request = LoRARequest(
                             lora_name=f"warmup_{lora_id}",
@@ -1684,10 +1688,12 @@ class ModelRunner(GPUModelRunnerBase[ModelInputForGPUWithSamplingMetadata]):
                                    is_prompt=is_prompt,
                                    virtual_engine=virtual_engine)
 
-    def load_lora(self,
+    def load_next_lora(self,
                   next_lora_list: List[LoRARequest]):
+        assert next_lora_list is not None, "next_lora_list is None, can not prefetch!"
         if (self.lora_config and next_lora_list is not None):
             for i in range(len(next_lora_list)):
+                print(f"will prefetch {next_lora_list[i]}...")
                 self.add_lora(next_lora_list[i])
 
     @torch.inference_mode()
@@ -1738,9 +1744,11 @@ class ModelRunner(GPUModelRunnerBase[ModelInputForGPUWithSamplingMetadata]):
             #     print(f"the first adapter is {next_lora_list[0]}...")
             #     self.add_lora(next_lora_list[self.adapter_id])
             #     self.adapter_id += 1
-            with torch.cuda.stream(stream_2):
-                self.load_lora(next_lora_list)
-            torch.cuda.synchronize(stream_2)
+            if model_input.next_lora_requests is not None:
+                next_lora_list = list(model_input.next_lora_requests)
+                with torch.cuda.stream(stream_2):
+                    self.load_next_lora(next_lora_list)
+                torch.cuda.synchronize(stream_2)
         else:
             model_executable = self.model
             self.adapter_id = 0

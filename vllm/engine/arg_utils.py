@@ -156,6 +156,8 @@ class EngineArgs:
     max_prompt_adapter_token: int = 0
     fully_sharded_loras: bool = False
     lora_extra_vocab_size: int = 256
+    prefetch: bool = False
+    prefetch_num: int = 0
     long_lora_scaling_factors: Optional[Tuple[float]] = None
     lora_dtype: Optional[Union[str, torch.dtype]] = 'auto'
     max_cpu_loras: Optional[int] = None
@@ -696,6 +698,16 @@ class EngineArgs:
                   'factors to be used at the same time. If not '
                   'specified, only adapters trained with the '
                   'base model scaling factor are allowed.'))
+        parser.add_argument(
+            '--prefetch',
+            action='store_true',
+            help=('If true, enable prefetching LoRA adapters. '))
+        parser.add_argument(
+            '--prefetch-num',
+            type=int,
+            default=EngineArgs.prefetch_num,
+            help=('When set > 0, the arg prefetch must be true. '
+                  'Default to 0. '))
         parser.add_argument(
             '--max-cpu-loras',
             type=int,
@@ -1305,6 +1317,8 @@ class EngineArgs:
             lora_extra_vocab_size=self.lora_extra_vocab_size,
             long_lora_scaling_factors=self.long_lora_scaling_factors,
             lora_dtype=self.lora_dtype,
+            prefetch=self.prefetch,
+            prefetch_num=self.prefetch_num,
             max_cpu_loras=self.max_cpu_loras if self.max_cpu_loras
             and self.max_cpu_loras > 0 else None) if self.enable_lora else None
 

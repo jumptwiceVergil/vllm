@@ -869,7 +869,7 @@ class Scheduler:
                 assert curr_loras is not None
                 assert self.lora_config is not None
                 if (lora_int_id > 0 and (lora_int_id not in curr_loras)
-                        and len(curr_loras) >= self.lora_config.max_loras/2):
+                        and len(curr_loras) >= self.lora_config.max_loras - self.lora_config.prefetch_num):
                     # We don't have a space for another LoRA, so
                     # we ignore this request for now.
                     leftover_swapped.appendleft(seq_group)
@@ -1141,7 +1141,7 @@ class Scheduler:
                 assert self.lora_config is not None
                 if (self.lora_enabled and lora_int_id > 0
                         and lora_int_id not in curr_loras
-                        and len(curr_loras) >= self.lora_config.max_loras/2):
+                        and len(curr_loras) >= self.lora_config.max_loras - self.lora_config.prefetch_num):
                     # We don't have a space for another LoRA, so
                     # we ignore this request for now.
                     leftover_waiting_sequences.appendleft(seq_group)
@@ -1290,9 +1290,8 @@ class Scheduler:
         assert len(swapped_in.prefill_seq_groups) == 0
 
         # Update ready queue
-        prefetch = True
-        if prefetch:
-            self._schedule_ready(int(self.lora_config.max_loras/2))
+        if self.lora_config.prefetch:
+            self._schedule_ready(self.lora_config.prefetch_num)
 
         # Merge lists
         num_prefill_groups = len(prefills.seq_groups)
@@ -1493,7 +1492,7 @@ class Scheduler:
 
     def schedule(
             self
-    ) -> Tuple[List[SequenceGroupMetadata], SchedulerOutputs, bool]:
+    ) -> Tuple[List[SequenceGroupMetadata], SchedulerOutputs, bool, Optional[List[NextGroupMetadata]]]:
         # Schedule sequence groups.
         # This function call changes the internal states of the scheduler
         # such as self.running, self.swapped, and self.waiting.
@@ -1622,13 +1621,14 @@ class Scheduler:
                     seq_group)
         
         next_group_metadata_list: List[NextGroupMetadata] = []
-        for seq in self.ready:
-            next_group_metadata = NextGroupMetadata(
-                request_id=seq.request_id,
-                next_lora_request=seq.lora_request
-            )
-            next_group_metadata_list.append(next_group_metadata)
-        if len(next_group_metadata_list) == 0:
+        if self.lora_config.prefetch:
+            for seq in self.ready:
+                next_group_metadata = NextGroupMetadata(
+                    request_id=seq.request_id,
+                    next_lora_request=seq.lora_request
+                )
+                next_group_metadata_list.append(next_group_metadata)
+        else:
             next_group_metadata_list = None
 
         # Now that the batch has been created, we can assume all blocks in the
@@ -1657,6 +1657,8 @@ class Scheduler:
         self.cache_id = self.next_cache_id
 
         # Return results
+        if self.lora_config.prefetch is False:
+            assert next_group_metadata_list is None
         return (seq_group_metadata_list, scheduler_outputs,
                 allow_async_output_proc, next_group_metadata_list)
 

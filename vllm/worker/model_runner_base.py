@@ -11,7 +11,7 @@ import torch.nn as nn
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.model_executor.layers.sampler import SamplerOutput
-from vllm.sequence import IntermediateTensors, SequenceGroupMetadata
+from vllm.sequence import IntermediateTensors, SequenceGroupMetadata, NextGroupMetadata
 
 if TYPE_CHECKING:
     from vllm.attention import AttentionMetadata
@@ -209,6 +209,7 @@ class ModelRunnerBase(ABC, Generic[T]):
         self,
         seq_group_metadata_list: List[SequenceGroupMetadata],
         virtual_engine: int = 0,
+        next_group_metadata_list: Optional[List[NextGroupMetadata]] = None,
         finished_requests_ids: Optional[List[str]] = None,
     ) -> T:
         """
