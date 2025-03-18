@@ -14,6 +14,7 @@ from vllm.lora.request import LoRARequest
 from vllm.prompt_adapter.request import PromptAdapterRequest
 from vllm.sequence import (Sequence, SequenceData, SequenceGroup,
                            SequenceGroupMetadata, SequenceGroupMetadataDelta,
+                           NextGroupMetadata,
                            SequenceStatus)
 from vllm.utils import Device, PyObjectCache
 
@@ -110,6 +111,10 @@ class ScheduledSequenceGroup:
     # chunked, it can be smaller than that.
     token_chunk_size: int
 
+@dataclass
+class NextSequenceGroup:
+    seq_group: SequenceGroup
+
 
 @dataclass
 class SchedulerOutputs:
@@ -133,6 +138,8 @@ class SchedulerOutputs:
     # The number of requests in the running queue
     running_queue_size: int
     preempted: int
+    # next sequence groups.
+    next_seq_groups: Optional[List[NextSequenceGroup]] = None
 
     def __post_init__(self):
         # Swap in and swap out should never happen at the same time.
@@ -345,6 +352,9 @@ class Scheduler:
         # Sequence groups in the SWAPPED state.
         # Contain decode requests that are swapped out.
         self.swapped: Deque[SequenceGroup] = deque()
+        # Sequence groups in the WAITING state.
+        # Contain the next batch requests.
+        self.ready: Deque[SequenceGroup] = deque()
         # Sequence groups finished requests ids since last step iteration.
         # It lets the model know that any state associated with these requests
         # can and must be released after the current step.
@@ -488,6 +498,13 @@ class Scheduler:
         finished_requests_ids = self._finished_requests_ids
         self._finished_requests_ids = list()
         return finished_requests_ids
+    
+    def _schedule_ready(self, prefetch_num: int):
+        if len(self.waiting) > prefetch_num:
+            self.ready = [self.waiting[i] for i in range(prefetch_num)]
+        else:
+            self.ready.clear()
+            self.ready.extend(self.waiting)
 
     def _schedule_running(
         self,
@@ -957,6 +974,12 @@ class Scheduler:
         assert len(running_scheduled.prefill_seq_groups) == 0
         assert len(swapped_in.prefill_seq_groups) == 0
 
+        if self.lora_config.prefetch:
+            self._schedule_ready(self.lora_config.prefetch_num)
+            next_seq_groups = [seq for seq in self.ready]
+        else:
+            next_seq_groups = None
+
         # Merge lists
         num_prefill_groups = len(prefills.seq_groups)
         if num_prefill_groups > 0:
@@ -983,6 +1006,7 @@ class Scheduler:
             num_lookahead_slots=running_scheduled.num_lookahead_slots,
             running_queue_size=len(self.running),
             preempted=preempted,
+            next_seq_groups=next_seq_groups,
         )
 
     def _schedule_chunked_prefill(self) -> SchedulerOutputs:
@@ -1103,7 +1127,7 @@ class Scheduler:
 
     def schedule(
             self
-    ) -> Tuple[List[SequenceGroupMetadata], SchedulerOutputs, bool]:
+    ) -> Tuple[List[SequenceGroupMetadata], SchedulerOutputs, bool, Optional[List[NextSequenceGroup]]]:
         # Schedule sequence groups.
         # This function call changes the internal states of the scheduler
         # such as self.running, self.swapped, and self.waiting.
@@ -1224,6 +1248,17 @@ class Scheduler:
             if allow_async_output_proc:
                 allow_async_output_proc = self._allow_async_output_proc(
                     seq_group)
+        
+        if scheduler_outputs.next_seq_groups is not None:
+            next_group_metadata_list: List[NextGroupMetadata] = []
+            for next_seq_group in scheduler_outputs.next_seq_groups:
+                next_group_metadata = NextGroupMetadata(
+                    request_id=next_seq_group.request_id,
+                    lora_request=next_seq_group.lora_request,
+                )
+                next_group_metadata_list.append(next_group_metadata)
+        else:
+            next_group_metadata_list = None
 
         # Now that the batch has been created, we can assume all blocks in the
         # batch will have been computed before the next scheduling invocation.
@@ -1252,7 +1287,7 @@ class Scheduler:
 
         # Return results
         return (seq_group_metadata_list, scheduler_outputs,
-                allow_async_output_proc)
+                allow_async_output_proc, next_group_metadata_list)
 
     def fork_seq(self, parent_seq: Sequence, child_seq: Sequence) -> None:
         self.block_manager.fork(parent_seq, child_seq)

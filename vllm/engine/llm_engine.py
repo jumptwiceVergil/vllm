@@ -1549,7 +1549,7 @@ class LLMEngine:
         if not self._has_remaining_steps(seq_group_metadata_list):
             # Schedule iteration
             (seq_group_metadata_list, scheduler_outputs,
-             allow_async_output_proc
+             allow_async_output_proc, next_group_metadata_list
              ) = self.scheduler[virtual_engine].schedule()
 
             ctx.seq_group_metadata_list = seq_group_metadata_list
@@ -1583,6 +1583,7 @@ class LLMEngine:
 
             execute_model_req = ExecuteModelRequest(
                 seq_group_metadata_list=seq_group_metadata_list,
+                next_group_metadata_list=next_group_metadata_list,
                 blocks_to_swap_in=scheduler_outputs.blocks_to_swap_in,
                 blocks_to_swap_out=scheduler_outputs.blocks_to_swap_out,
                 blocks_to_copy=scheduler_outputs.blocks_to_copy,
