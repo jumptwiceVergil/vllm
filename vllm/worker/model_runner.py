@@ -5,6 +5,8 @@ import itertools
 import time
 import warnings
 import weakref
+import threading
+import queue
 from dataclasses import dataclass
 from typing import (TYPE_CHECKING, Any, Callable, Dict, List, Optional, Set,
                     Tuple, Type, TypeVar, Union)
@@ -61,6 +63,7 @@ if TYPE_CHECKING:
     from vllm.attention.backends.abstract import AttentionBackend
 
 logger = init_logger(__name__)
+stream_graph: torch.cuda.Stream
 
 LORA_WARMUP_RANK = 8
 _BATCH_SIZE_ALIGNMENT = 8
@@ -1537,6 +1540,8 @@ class GPUModelRunnerBase(ModelRunnerBase[TModelInputForGPU]):
                         "stream":
                         graph_capture_context.stream
                     }
+                    global stream_graph
+                    stream_graph = graph_capture_context.stream
                     if previous_hidden_states is not None:
                         capture_inputs[
                             "previous_hidden_states"] = previous_hidden_states[:
@@ -1596,6 +1601,11 @@ class ModelRunner(GPUModelRunnerBase[ModelInputForGPUWithSamplingMetadata]):
     _model_input_cls: Type[ModelInputForGPUWithSamplingMetadata] = (
         ModelInputForGPUWithSamplingMetadata)
     _builder_cls: Type[ModelInputForGPUBuilder] = ModelInputForGPUBuilder
+    stream_list: List[torch.cuda.Stream] = []
+    adapter_id: int = 0
+    counter: int = 0
+    wait = False
+    result_queue = queue.Queue()
 
     def make_model_input_from_broadcasted_tensor_dict(
         self,
@@ -1646,14 +1656,61 @@ class ModelRunner(GPUModelRunnerBase[ModelInputForGPUWithSamplingMetadata]):
                                    is_prompt=is_prompt,
                                    virtual_engine=virtual_engine)
 
+    def get_prefetch_stream(self, num):
+        if len(self.stream_list) == 0:
+            for _ in range(2):
+                self.stream_list.append(torch.cuda.Stream())
+        return self.stream_list[num]
+
+    def load_lora(self, lora_request: LoRARequest, stream_id: int):
+        with torch.cuda.stream(self.get_prefetch_stream(stream_id)):
+            print(f"will prefetch {lora_request}")
+            self.add_lora(lora_request)
+
     def load_next_lora(self, next_lora_list: List[LoRARequest]):
         assert next_lora_list is not None, "next_lora_list is None, can not prefetch!"
-        stream = torch.cuda.Stream()
-        with torch.cuda.stream(stream):
-            for i in range(len(next_lora_list)):
-                print(f"will prefetch {next_lora_list[i]}...")
-                self.add_lora(next_lora_list[i])
-        torch.cuda.synchronize(stream)
+        # multi stream
+        assert torch.cuda.is_available()
+        # threads = []
+        # if self.adapter_id < len(next_lora_list) - 1:
+        #     part_lora_list = next_lora_list[self.adapter_id:self.adapter_id+2]
+        #     self.adapter_id += 2
+        #     for i in range(2):
+        #         t = threading.Thread(target=self.load_lora, args=(part_lora_list[i],i,))
+        #         threads.append(t)
+        #         t.start()
+        #     torch.cuda.synchronize()
+        #     for t in threads:
+        #         t.join()
+        # else:
+        #     lora = next_lora_list[self.adapter_id]
+        #     self.adapter_id += 1
+        #     print(f"will prefetch {lora}")
+        #     self.add_lora(lora)
+
+        with torch.cuda.stream(self.get_prefetch_stream(0)):
+            # if self.adapter_id < len(next_lora_list):
+            #     lora = next_lora_list[self.adapter_id]
+            #     self.adapter_id += 1
+            #     print(f"will prefetch {lora}")
+            #     self.add_lora(lora)
+            # for lora in next_lora_list:
+            #     print(f"will prefetch {lora}")
+            #     self.add_lora(lora)
+            for _ in range(10):
+                if self.adapter_id < len(next_lora_list):
+                    lora = next_lora_list[self.adapter_id]
+                    self.adapter_id += 1
+                    print(f"will prefetch {lora}")
+                    self.add_lora(lora)
+                else:
+                    break
+
+        # default stream
+        # if self.adapter_id < len(next_lora_list):
+        #     print(f"will prefetch {next_lora_list[self.adapter_id]}...")
+        #     self.add_lora(next_lora_list[self.adapter_id])
+        #     self.adapter_id += 1
 
     @torch.inference_mode()
     @dump_input_when_exception(exclude_args=[0], exclude_kwargs=["self"])
@@ -1686,6 +1743,39 @@ class ModelRunner(GPUModelRunnerBase[ModelInputForGPUWithSamplingMetadata]):
         assert model_input.attn_metadata is not None
         prefill_meta = model_input.attn_metadata.prefill_metadata
         decode_meta = model_input.attn_metadata.decode_metadata
+
+        # decode = prefill_meta is None and decode_meta.use_cuda_graph
+
+        # if not decode:
+        #     result = self.execute_model_v2(model_input, kv_caches, decode_meta, intermediate_tensors, prefill_meta)
+        #     self.result_queue.get()
+        #     self.counter = 0
+        #     self.wait = False
+        #     return result
+        # elif not self.wait:
+        #     self.wait = True
+        #     if self.lora_config.prefetch and model_input.next_lora_requests is not None:
+        #         next_lora_list = list(model_input.next_lora_requests)
+        #         t1 = threading.Thread(target=self.execute_model_v2, args=(model_input, kv_caches, decode_meta, intermediate_tensors, prefill_meta))
+        #         t1.start()
+        #         t2 = threading.Thread(target=self.load_next_lora, args=(next_lora_list,))
+        #         t2.start()
+        #         t1.join()
+        #         return self.result_queue.get()
+        #     else:
+        #         result = self.execute_model_v2(model_input, kv_caches, decode_meta, intermediate_tensors, prefill_meta)
+        #         self.result_queue.get()
+        #         return result
+        # else:
+        #     self.counter += 1
+        #     if self.counter > 20:
+        #         self.wait = False
+        #         self.counter = 0
+        #         torch.cuda.synchronize()
+        #     result = self.execute_model_v2(model_input, kv_caches, decode_meta, intermediate_tensors, prefill_meta)
+        #     self.result_queue.get()
+        #     return result
+
         # TODO(andoorve): We can remove this once all
         # virtual engines share the same kv cache.
         virtual_engine = model_input.virtual_engine
@@ -1694,10 +1784,17 @@ class ModelRunner(GPUModelRunnerBase[ModelInputForGPUWithSamplingMetadata]):
             graph_batch_size = model_input.input_tokens.shape[0]
             model_executable = self.graph_runners[virtual_engine][
                 graph_batch_size]
-            if self.lora_config and model_input.next_lora_requests is not None:
+            if self.lora_config.prefetch and model_input.next_lora_requests is not None:
+                # prefetch_executable = self.prefetch_runner
                 next_lora_list = list(model_input.next_lora_requests)
-                self.load_next_lora(next_lora_list)
+                if self.adapter_id < len(next_lora_list):
+                    # self.load_next_lora(next_lora_list)
+                    lora = next_lora_list[self.adapter_id]
+                    self.adapter_id += 1
+                    print(f"will prefetch {lora}")
+                    self.add_lora(lora)
         else:
+            self.adapter_id = 0
             model_executable = self.model
 
         multi_modal_kwargs = model_input.multi_modal_kwargs or {}
@@ -1792,6 +1889,133 @@ class ModelRunner(GPUModelRunnerBase[ModelInputForGPUWithSamplingMetadata]):
             output.hidden_states = hidden_states
 
         return [output]
+
+    @torch.inference_mode()
+    @dump_input_when_exception(exclude_args=[0], exclude_kwargs=["self"])
+    def execute_model_v2(
+        self,
+        model_input: ModelInputForGPUWithSamplingMetadata,
+        kv_caches: List[torch.Tensor],
+        decode_meta: AttentionMetadata,
+        intermediate_tensors: Optional[IntermediateTensors] = None,
+        prefill_meta: Optional[AttentionMetadata] = None
+    ) -> Optional[Union[List[SamplerOutput], IntermediateTensors]]:
+        with torch.cuda.stream(self.get_prefetch_stream(1)):
+            # TODO(andoorve): We can remove this once all
+            # virtual engines share the same kv cache.
+            virtual_engine = model_input.virtual_engine
+            if prefill_meta is None and decode_meta.use_cuda_graph:
+                assert model_input.input_tokens is not None
+                graph_batch_size = model_input.input_tokens.shape[0]
+                model_executable = self.graph_runners[virtual_engine][
+                    graph_batch_size]
+                # if self.lora_config.prefetch and model_input.next_lora_requests is not None:
+                #     # prefetch_executable = self.prefetch_runner
+                #     next_lora_list = list(model_input.next_lora_requests)
+                #     if self.adapter_id < len(next_lora_list):
+                #         # self.load_next_lora(next_lora_list)
+                #         lora = next_lora_list[self.adapter_id]
+                #         self.adapter_id += 1
+                #         print(f"will prefetch {lora}")
+                #         self.add_lora(lora)
+            else:
+                self.adapter_id = 0
+                model_executable = self.model
+
+            multi_modal_kwargs = model_input.multi_modal_kwargs or {}
+            seqlen_agnostic_kwargs = {
+                "finished_requests_ids": model_input.finished_requests_ids,
+                "request_ids_to_seq_ids": model_input.request_ids_to_seq_ids,
+            } if self.has_inner_state else {}
+            if (self.observability_config is not None
+                    and self.observability_config.collect_model_forward_time):
+                model_forward_start = torch.cuda.Event(enable_timing=True)
+                model_forward_end = torch.cuda.Event(enable_timing=True)
+                model_forward_start.record()
+
+            with set_forward_context(model_input.attn_metadata):
+                hidden_or_intermediate_states = model_executable(
+                    input_ids=model_input.input_tokens,
+                    positions=model_input.input_positions,
+                    kv_caches=kv_caches,
+                    attn_metadata=model_input.attn_metadata,
+                    intermediate_tensors=intermediate_tensors,
+                    **MultiModalInputs.as_kwargs(multi_modal_kwargs,
+                                                device=self.device),
+                    **seqlen_agnostic_kwargs)
+
+            if (self.observability_config is not None
+                    and self.observability_config.collect_model_forward_time):
+                model_forward_end.record()
+
+            # Compute the logits in the last pipeline stage.
+            if not get_pp_group().is_last_rank:
+                if (self.is_driver_worker
+                        and hidden_or_intermediate_states is not None
+                        and isinstance(hidden_or_intermediate_states,
+                                    IntermediateTensors)
+                        and self.observability_config is not None
+                        and self.observability_config.collect_model_forward_time):
+                    model_forward_end.synchronize()
+                    model_forward_time = model_forward_start.elapsed_time(
+                        model_forward_end)
+                    orig_model_forward_time = 0.0
+                    if intermediate_tensors is not None:
+                        orig_model_forward_time = intermediate_tensors.tensors.get(
+                            "model_forward_time", torch.tensor(0.0)).item()
+                    hidden_or_intermediate_states.tensors["model_forward_time"] = (
+                        torch.tensor(model_forward_time + orig_model_forward_time))
+                return hidden_or_intermediate_states
+
+            logits = self.model.compute_logits(hidden_or_intermediate_states,
+                                            model_input.sampling_metadata)
+
+            if not self.is_driver_worker:
+                return []
+
+            if model_input.async_callback is not None:
+                model_input.async_callback()
+
+            # Sample the next token.
+            output: SamplerOutput = self.model.sample(
+                logits=logits,
+                sampling_metadata=model_input.sampling_metadata,
+            )
+            if (self.observability_config is not None
+                    and self.observability_config.collect_model_forward_time
+                    and output is not None):
+                model_forward_end.synchronize()
+                model_forward_time = model_forward_start.elapsed_time(
+                    model_forward_end)
+                orig_model_forward_time = 0.0
+                if intermediate_tensors is not None:
+                    orig_model_forward_time = intermediate_tensors.tensors.get(
+                        "model_forward_time", torch.tensor(0.0)).item()
+                # If there are multiple workers, we are still tracking the latency
+                # from the start time of the driver worker to the end time of the
+                # driver worker. The model forward time will then end up covering
+                # the communication time as well.
+                output.model_forward_time = (orig_model_forward_time +
+                                            model_forward_time)
+
+            if self.return_hidden_states:
+                # we only need to pass hidden states of most recent token
+                assert model_input.sampling_metadata is not None
+                indices = model_input.sampling_metadata.selected_token_indices
+                if model_input.is_prompt:
+                    hidden_states = hidden_or_intermediate_states.index_select(
+                        0, indices)
+                    output.prefill_hidden_states = hidden_or_intermediate_states
+                elif decode_meta.use_cuda_graph:
+                    hidden_states = hidden_or_intermediate_states[:len(indices)]
+                else:
+                    hidden_states = hidden_or_intermediate_states
+
+                output.hidden_states = hidden_states
+            
+            self.result_queue.put([output])
+
+            return [output]
 
 
 class CUDAGraphRunner:
@@ -1947,6 +2171,25 @@ class CUDAGraphRunner:
     def __call__(self, *args, **kwargs):
         return self.forward(*args, **kwargs)
 
+
+@torch.inference_mode()
+def execute_decode(
+    graph: CUDAGraphRunner,
+    input_ids: torch.Tensor,
+    positions: torch.Tensor,
+    kv_caches: List[torch.Tensor],
+    attn_metadata: AttentionMetadata,
+    intermediate_tensors: Optional[IntermediateTensors],
+    kwargs1, kwargs2):
+    with torch.cuda.stream(stream_graph):
+        hidden_or_intermediate_states = graph(input_ids=input_ids,
+                                                positions=positions,
+                                                kv_caches=kv_caches,
+                                                attn_metadata=attn_metadata,
+                                                intermediate_tensors=intermediate_tensors,
+                                                **kwargs1,
+                                                **kwargs2)
+        result_queue.put(hidden_or_intermediate_states)
 
 def _get_graph_batch_size(batch_size: int) -> int:
     """Returns the padded batch size given actual batch size.

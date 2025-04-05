@@ -364,6 +364,7 @@ class LocalOrDistributedWorkerBase(WorkerBase):
         All workers take the same request, prepare the input and
         execute the model.
         """
+        assert 1==0
         assert execute_model_req is not None, (
             "_execute_model_spmd() requires each worker to take in an "
             "ExecuteModelRequest")

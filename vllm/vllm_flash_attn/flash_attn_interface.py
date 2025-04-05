@@ -1,6 +1,6 @@
 # Copyright (c) 2023, Tri Dao.
 
-from typing import Optional, Union, Tuple, List
+from typing import Optional, Union
 
 import torch
 import torch.nn as nn
@@ -8,93 +8,1094 @@ import torch.nn as nn
 # isort: off
 # We need to import the CUDA kernels after importing torch
 # Use relative import to support build-from-source installation in vLLM
-
-try:
-    from . import _vllm_fa2_C  # noqa: F401
-    FA2_UNAVAILABLE_REASON = None
-    FA2_AVAILABLE = True
-except ImportError as e:
-    FA2_UNAVAILABLE_REASON = str(e)
-    FA2_AVAILABLE = False
-
-try:
-    from . import _vllm_fa3_C  # noqa: F401
-    FA3_UNAVAILABLE_REASON = None
-    FA3_AVAILABLE = True
-except ImportError as e:
-    FA3_UNAVAILABLE_REASON = str(e)
-    FA3_AVAILABLE = False
+from . import vllm_flash_attn_c # noqa: F401
 
 # isort: on
 
-DEFAULT_FA_VERSION = 2
-
-def _is_fa2_supported(device = None) -> Tuple[bool, Optional[str]]:
-    if not FA2_AVAILABLE:
-        return False, f"FA2 is unavaible due to: {FA2_UNAVAILABLE_REASON}"
-    if torch.cuda.get_device_capability(device)[0] < 8:
-        return False, \
-            "FA2 is only supported on devices with compute capability < 8"
-    return True, None
-    
-def _is_fa3_supported(device = None) -> Tuple[bool, Optional[str]]:
-    if not FA3_AVAILABLE:
-        return False, f"FA3 is unavaible due to: {FA3_UNAVAILABLE_REASON}"
-    if torch.cuda.get_device_capability(device)[0] < 8 \
-        or torch.cuda.get_device_capability(device) == (8, 6) \
-        or torch.cuda.get_device_capability(device) == (8, 9):
-        return False, \
-            "FA3 is only supported on devices with compute capability >= 8" \
-            " excluding 8.6 and 8.9"
-    return True, None
-
-def is_fa_version_supported(fa_version: int, device = None) -> bool:
-    assert fa_version in [2, 3], f"Unsupported FA version: {fa_version}"
-    if fa_version == 2:
-        return _is_fa2_supported(device)[0]
-    elif fa_version == 3:
-        return _is_fa3_supported(device)[0]
-
-def fa_version_unsupported_reason(fa_version: int, device = None) \
-    -> Optional[str]:
-    assert fa_version in [2, 3], f"Unsupported FA version: {fa_version}"
-    if fa_version == 2:
-        return _is_fa3_supported(device)[1]
-    elif fa_version == 3:
-        return _is_fa3_supported(device)[1]
-
-#
-#  For vLLM we only care about `flash_attn_varlen_func` and 
-#   `flash_attn_with_kvcache` so we only maintain wrappers for these two.
-#
-
-
 def maybe_contiguous(x):
     return x.contiguous() if x is not None and x.stride(-1) != 1 else x
+
+def _get_block_size_n(device, head_dim, is_dropout, is_causal):
+    # This should match the block sizes in the CUDA kernel
+    assert head_dim <= 256
+    major, minor = torch.cuda.get_device_capability(device)
+    is_sm8x = major == 8 and minor > 0  # Only include sm86 and sm89, exclude sm80 (A100)
+    is_sm80 = major == 8 and minor == 0
+    is_sm90 = major == 9 and minor == 0
+    if head_dim <= 32:
+        return 128
+    if head_dim <= 64:
+        return 128 if not is_dropout else 64
+    elif head_dim <= 96:
+        return 64
+    elif head_dim <= 128:
+        if is_sm8x:
+            return 64 if (not is_dropout and is_causal) else 32
+        else:
+            return 64 if not is_dropout else 32
+    elif head_dim <= 160:
+        if is_sm8x:
+            return 64
+        else:
+            return 32
+    elif head_dim <= 192:
+        return 64
+    elif head_dim <= 224:
+        return 64
+    elif head_dim <= 256:
+        return 64
+
+
+def _flash_attn_forward(
+    q, k, v, dropout_p, softmax_scale, causal, window_size, softcap, alibi_slopes, return_softmax, *, out=None
+):
+    q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
+    out, q, k, v, out_padded, softmax_lse, S_dmask, rng_state = torch.ops.vllm_flash_attn_c.fwd(
+        q,
+        k,
+        v,
+        out,
+        alibi_slopes,
+        dropout_p,
+        softmax_scale,
+        causal,
+        window_size[0],
+        window_size[1],
+        softcap,
+        return_softmax,
+        None,
+    )
+    return out, q, k, v, out_padded, softmax_lse, S_dmask, rng_state
+
+
+def _flash_attn_varlen_forward(
+    q,
+    k,
+    v,
+    cu_seqlens_q,
+    cu_seqlens_k,
+    max_seqlen_q,
+    max_seqlen_k,
+    dropout_p,
+    softmax_scale,
+    causal,
+    window_size,
+    softcap,
+    alibi_slopes,
+    return_softmax,
+    block_table,
+    *,
+    out=None
+):
+    q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
+    out, q, k, v, out_padded, softmax_lse, S_dmask, rng_state = torch.ops.vllm_flash_attn_c.varlen_fwd(
+        q,
+        k,
+        v,
+        out,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        None,
+        block_table,
+        alibi_slopes,
+        max_seqlen_q,
+        max_seqlen_k,
+        dropout_p,
+        softmax_scale,
+        False,
+        causal,
+        window_size[0],
+        window_size[1],
+        softcap,
+        return_softmax,
+        None,
+    )
+    # if out.isnan().any() or softmax_lse.isnan().any():
+    #     breakpoint()
+    return out, q, k, v, out_padded, softmax_lse, S_dmask, rng_state
+
+
+def _flash_attn_backward(
+    dout,
+    q,
+    k,
+    v,
+    out,
+    softmax_lse,
+    dq,
+    dk,
+    dv,
+    dropout_p,
+    softmax_scale,
+    causal,
+    window_size,
+    softcap,
+    alibi_slopes,
+    deterministic,
+    rng_state=None,
+):
+    # dq, dk, dv are allocated by us so they should already be contiguous
+    dout, q, k, v, out = [maybe_contiguous(x) for x in (dout, q, k, v, out)]
+    (
+        dq,
+        dk,
+        dv,
+        softmax_d,
+    ) = torch.ops.vllm_flash_attn_c.bwd(
+        dout,
+        q,
+        k,
+        v,
+        out,
+        softmax_lse,
+        dq,
+        dk,
+        dv,
+        alibi_slopes,
+        dropout_p,
+        softmax_scale,
+        causal,
+        window_size[0],
+        window_size[1],
+        softcap,
+        deterministic,
+        None,
+        rng_state,
+    )
+    return dq, dk, dv, softmax_d
+
+
+def _flash_attn_varlen_backward(
+    dout,
+    q,
+    k,
+    v,
+    out,
+    softmax_lse,
+    dq,
+    dk,
+    dv,
+    cu_seqlens_q,
+    cu_seqlens_k,
+    max_seqlen_q,
+    max_seqlen_k,
+    dropout_p,
+    softmax_scale,
+    causal,
+    window_size,
+    softcap,
+    alibi_slopes,
+    deterministic,
+    rng_state=None,
+):
+    # dq, dk, dv are allocated by us so they should already be contiguous
+    dout, q, k, v, out = [maybe_contiguous(x) for x in (dout, q, k, v, out)]
+    (
+        dq,
+        dk,
+        dv,
+        softmax_d,
+    ) = torch.ops.vllm_flash_attn_c.varlen_bwd(
+        dout,
+        q,
+        k,
+        v,
+        out,
+        softmax_lse,
+        dq,
+        dk,
+        dv,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        alibi_slopes,
+        max_seqlen_q,
+        max_seqlen_k,
+        dropout_p,
+        softmax_scale,
+        False,
+        causal,
+        window_size[0],
+        window_size[1],
+        softcap,
+        deterministic,
+        None,
+        rng_state,
+    )
+    # if dk.isnan().any() or dk.isnan().any() or dv.isnan().any() or softmax_d.isnan().any():
+    #     breakpoint()
+    return dq, dk, dv, softmax_d
+
+
+class FlashAttnQKVPackedFunc(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx,
+        qkv,
+        dropout_p,
+        softmax_scale,
+        causal,
+        window_size,
+        softcap,
+        alibi_slopes,
+        deterministic,
+        return_softmax,
+        *,
+        out=None,
+    ):
+        if softmax_scale is None:
+            softmax_scale = qkv.shape[-1] ** (-0.5)
+        out, q, k, v, out_padded, softmax_lse, S_dmask, rng_state = _flash_attn_forward(
+            qkv[:, :, 0],
+            qkv[:, :, 1],
+            qkv[:, :, 2],
+            dropout_p,
+            softmax_scale,
+            causal=causal,
+            window_size=window_size,
+            softcap=softcap,
+            alibi_slopes=alibi_slopes,
+            return_softmax=return_softmax and dropout_p > 0,
+            out=out,
+        )
+        ctx.save_for_backward(q, k, v, out_padded, softmax_lse, rng_state)
+        ctx.dropout_p = dropout_p
+        ctx.softmax_scale = softmax_scale
+        ctx.causal = causal
+        ctx.window_size = window_size
+        ctx.softcap = softcap
+        ctx.alibi_slopes = alibi_slopes
+        ctx.deterministic = deterministic
+        return out if not return_softmax else (out, softmax_lse, S_dmask)
+
+    @staticmethod
+    def backward(ctx, dout, *args):
+        q, k, v, out, softmax_lse, rng_state = ctx.saved_tensors
+        qkv_shape = q.shape[:-2] + (3, *q.shape[-2:])
+        dqkv = torch.empty(qkv_shape, dtype=q.dtype, device=q.device)
+        _flash_attn_backward(
+            dout,
+            q,
+            k,
+            v,
+            out,
+            softmax_lse,
+            dqkv[:, :, 0],
+            dqkv[:, :, 1],
+            dqkv[:, :, 2],
+            ctx.dropout_p,
+            ctx.softmax_scale,
+            ctx.causal,
+            ctx.window_size,
+            ctx.softcap,
+            ctx.alibi_slopes,
+            ctx.deterministic,
+            rng_state=rng_state,
+        )
+        dqkv = dqkv[..., : dout.shape[-1]]  # We could have padded the head dimension
+        return dqkv, None, None, None, None, None, None, None, None
+
+
+class FlashAttnVarlenQKVPackedFunc(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx,
+        qkv,
+        cu_seqlens,
+        max_seqlen,
+        dropout_p,
+        softmax_scale,
+        causal,
+        window_size,
+        softcap,
+        alibi_slopes,
+        deterministic,
+        return_softmax,
+        *,
+        out=None,
+    ):
+        if softmax_scale is None:
+            softmax_scale = qkv.shape[-1] ** (-0.5)
+        out, q, k, v, out_padded, softmax_lse, S_dmask, rng_state = _flash_attn_varlen_forward(
+            qkv[:, 0],
+            qkv[:, 1],
+            qkv[:, 2],
+            cu_seqlens,
+            cu_seqlens,
+            max_seqlen,
+            max_seqlen,
+            dropout_p,
+            softmax_scale,
+            causal=causal,
+            window_size=window_size,
+            softcap=softcap,
+            alibi_slopes=alibi_slopes,
+            return_softmax=return_softmax and dropout_p > 0,
+            block_table=None,
+            out=out,
+        )
+        ctx.save_for_backward(q, k, v, out_padded, softmax_lse, cu_seqlens, rng_state)
+        ctx.dropout_p = dropout_p
+        ctx.max_seqlen = max_seqlen
+        ctx.softmax_scale = softmax_scale
+        ctx.causal = causal
+        ctx.window_size = window_size
+        ctx.softcap = softcap
+        ctx.alibi_slopes = alibi_slopes
+        ctx.deterministic = deterministic
+        return out if not return_softmax else (out, softmax_lse, S_dmask)
+
+    @staticmethod
+    def backward(ctx, dout, *args):
+        q, k, v, out, softmax_lse, cu_seqlens, rng_state = ctx.saved_tensors
+        qkv_shape = q.shape[:-2] + (3, *q.shape[-2:])
+        dqkv = torch.empty(qkv_shape, dtype=q.dtype, device=q.device)
+        _flash_attn_varlen_backward(
+            dout,
+            q,
+            k,
+            v,
+            out,
+            softmax_lse,
+            dqkv[:, 0],
+            dqkv[:, 1],
+            dqkv[:, 2],
+            cu_seqlens,
+            cu_seqlens,
+            ctx.max_seqlen,
+            ctx.max_seqlen,
+            ctx.dropout_p,
+            ctx.softmax_scale,
+            ctx.causal,
+            ctx.window_size,
+            ctx.softcap,
+            ctx.alibi_slopes,
+            ctx.deterministic,
+            rng_state=rng_state,
+        )
+        dqkv = dqkv[..., : dout.shape[-1]]  # We could have padded the head dimension
+        return dqkv, None, None, None, None, None, None, None, None, None, None
+
+
+class FlashAttnKVPackedFunc(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx,
+        q,
+        kv,
+        dropout_p,
+        softmax_scale,
+        causal,
+        window_size,
+        softcap,
+        alibi_slopes,
+        deterministic,
+        return_softmax,
+        out=None,
+    ):
+        if softmax_scale is None:
+            softmax_scale = q.shape[-1] ** (-0.5)
+        out, q, k, v, out_padded, softmax_lse, S_dmask, rng_state = _flash_attn_forward(
+            q,
+            kv[:, :, 0],
+            kv[:, :, 1],
+            dropout_p,
+            softmax_scale,
+            causal=causal,
+            window_size=window_size,
+            softcap=softcap,
+            alibi_slopes=alibi_slopes,
+            return_softmax=return_softmax and dropout_p > 0,
+            out=out,
+        )
+        ctx.save_for_backward(q, k, v, out_padded, softmax_lse, rng_state)
+        ctx.dropout_p = dropout_p
+        ctx.softmax_scale = softmax_scale
+        ctx.causal = causal
+        ctx.window_size = window_size
+        ctx.softcap = softcap
+        ctx.alibi_slopes = alibi_slopes
+        ctx.deterministic = deterministic
+        return out if not return_softmax else (out, softmax_lse, S_dmask)
+
+    @staticmethod
+    def backward(ctx, dout, *args):
+        q, k, v, out, softmax_lse, rng_state = ctx.saved_tensors
+        dq = torch.empty_like(q)
+        kv_shape = k.shape[:-2] + (2, *k.shape[-2:])
+        dkv = torch.empty(kv_shape, dtype=k.dtype, device=k.device)
+        _flash_attn_backward(
+            dout,
+            q,
+            k,
+            v,
+            out,
+            softmax_lse,
+            dq,
+            dkv[:, :, 0],
+            dkv[:, :, 1],
+            ctx.dropout_p,
+            ctx.softmax_scale,
+            ctx.causal,
+            ctx.window_size,
+            ctx.softcap,
+            ctx.alibi_slopes,
+            ctx.deterministic,
+            rng_state=rng_state,
+        )
+        dq = dq[..., : dout.shape[-1]]  # We could have padded the head dimension
+        dkv = dkv[..., : dout.shape[-1]]
+        return dq, dkv, None, None, None, None, None, None, None, None
+
+
+class FlashAttnVarlenKVPackedFunc(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx,
+        q,
+        kv,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        max_seqlen_q,
+        max_seqlen_k,
+        dropout_p,
+        softmax_scale,
+        causal,
+        window_size,
+        softcap,
+        alibi_slopes,
+        deterministic,
+        return_softmax,
+        out=None,
+    ):
+        if softmax_scale is None:
+            softmax_scale = q.shape[-1] ** (-0.5)
+        out, q, k, v, out_padded, softmax_lse, S_dmask, rng_state = _flash_attn_varlen_forward(
+            q,
+            kv[:, 0],
+            kv[:, 1],
+            cu_seqlens_q,
+            cu_seqlens_k,
+            max_seqlen_q,
+            max_seqlen_k,
+            dropout_p,
+            softmax_scale,
+            causal=causal,
+            window_size=window_size,
+            softcap=softcap,
+            alibi_slopes=alibi_slopes,
+            return_softmax=return_softmax and dropout_p > 0,
+            block_table=None,
+            out=out,
+        )
+        ctx.save_for_backward(
+            q, k, v, out_padded, softmax_lse, cu_seqlens_q, cu_seqlens_k, rng_state
+        )
+        ctx.dropout_p = dropout_p
+        ctx.max_seqlen_q = max_seqlen_q
+        ctx.max_seqlen_k = max_seqlen_k
+        ctx.softmax_scale = softmax_scale
+        ctx.causal = causal
+        ctx.window_size = window_size
+        ctx.softcap = softcap
+        ctx.alibi_slopes = alibi_slopes
+        ctx.deterministic = deterministic
+        return out if not return_softmax else (out, softmax_lse, S_dmask)
+
+    @staticmethod
+    def backward(ctx, dout, *args):
+        q, k, v, out, softmax_lse, cu_seqlens_q, cu_seqlens_k, rng_state = ctx.saved_tensors
+        dq = torch.empty_like(q)
+        kv_shape = k.shape[:-2] + (2, *k.shape[-2:])
+        dkv = torch.empty(kv_shape, dtype=k.dtype, device=k.device)
+        _flash_attn_varlen_backward(
+            dout,
+            q,
+            k,
+            v,
+            out,
+            softmax_lse,
+            dq,
+            dkv[:, 0],
+            dkv[:, 1],
+            cu_seqlens_q,
+            cu_seqlens_k,
+            ctx.max_seqlen_q,
+            ctx.max_seqlen_k,
+            ctx.dropout_p,
+            ctx.softmax_scale,
+            ctx.causal,
+            ctx.window_size,
+            ctx.softcap,
+            ctx.alibi_slopes,
+            ctx.deterministic,
+            rng_state=rng_state,
+        )
+        dq = dq[..., : dout.shape[-1]]  # We could have padded the head dimension
+        dkv = dkv[..., : dout.shape[-1]]
+        return dq, dkv, None, None, None, None, None, None, None, None, None, None, None, None
+
+
+class FlashAttnFunc(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx,
+        q,
+        k,
+        v,
+        dropout_p,
+        softmax_scale,
+        causal,
+        window_size,
+        softcap,
+        alibi_slopes,
+        deterministic,
+        return_softmax,
+        out=None,
+    ):
+        if softmax_scale is None:
+            softmax_scale = q.shape[-1] ** (-0.5)
+        out, q, k, v, out_padded, softmax_lse, S_dmask, rng_state = _flash_attn_forward(
+            q,
+            k,
+            v,
+            dropout_p,
+            softmax_scale,
+            causal=causal,
+            window_size=window_size,
+            softcap=softcap,
+            alibi_slopes=alibi_slopes,
+            return_softmax=return_softmax and dropout_p > 0,
+            out=out,
+        )
+        ctx.save_for_backward(q, k, v, out_padded, softmax_lse, rng_state)
+        ctx.dropout_p = dropout_p
+        ctx.softmax_scale = softmax_scale
+        ctx.causal = causal
+        ctx.window_size = window_size
+        ctx.softcap = softcap
+        ctx.alibi_slopes = alibi_slopes
+        ctx.deterministic = deterministic
+        return out if not return_softmax else (out, softmax_lse, S_dmask)
+
+    @staticmethod
+    def backward(ctx, dout, *args):
+        q, k, v, out, softmax_lse, rng_state = ctx.saved_tensors
+        dq, dk, dv = torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
+        _flash_attn_backward(
+            dout,
+            q,
+            k,
+            v,
+            out,
+            softmax_lse,
+            dq,
+            dk,
+            dv,
+            ctx.dropout_p,
+            ctx.softmax_scale,
+            ctx.causal,
+            ctx.window_size,
+            ctx.softcap,
+            ctx.alibi_slopes,
+            ctx.deterministic,
+            rng_state=rng_state,
+        )
+        dq = dq[..., : dout.shape[-1]]  # We could have padded the head dimension
+        dk = dk[..., : dout.shape[-1]]
+        dv = dv[..., : dout.shape[-1]]
+        return dq, dk, dv, None, None, None, None, None, None, None, None
+
+
+class FlashAttnVarlenFunc(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx,
+        q,
+        k,
+        v,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        max_seqlen_q,
+        max_seqlen_k,
+        dropout_p,
+        softmax_scale,
+        causal,
+        window_size,
+        softcap,
+        alibi_slopes,
+        deterministic,
+        return_softmax,
+        block_table,
+        out=None,
+    ):
+        if softmax_scale is None:
+            softmax_scale = q.shape[-1] ** (-0.5)
+        out, q, k, v, out_padded, softmax_lse, S_dmask, rng_state = _flash_attn_varlen_forward(
+            q,
+            k,
+            v,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            max_seqlen_q,
+            max_seqlen_k,
+            dropout_p,
+            softmax_scale,
+            causal=causal,
+            window_size=window_size,
+            softcap=softcap,
+            alibi_slopes=alibi_slopes,
+            return_softmax=return_softmax and dropout_p > 0,
+            block_table=block_table,
+            out=out,
+        )
+        ctx.save_for_backward(
+            q, k, v, out_padded, softmax_lse, cu_seqlens_q, cu_seqlens_k, rng_state
+        )
+        ctx.dropout_p = dropout_p
+        ctx.max_seqlen_q = max_seqlen_q
+        ctx.max_seqlen_k = max_seqlen_k
+        ctx.softmax_scale = softmax_scale
+        ctx.causal = causal
+        ctx.window_size = window_size
+        ctx.softcap = softcap
+        ctx.alibi_slopes = alibi_slopes
+        ctx.deterministic = deterministic
+        return out if not return_softmax else (out, softmax_lse, S_dmask)
+
+    @staticmethod
+    def backward(ctx, dout, *args):
+        q, k, v, out, softmax_lse, cu_seqlens_q, cu_seqlens_k, rng_state = ctx.saved_tensors
+        dq, dk, dv = torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
+        _flash_attn_varlen_backward(
+            dout,
+            q,
+            k,
+            v,
+            out,
+            softmax_lse,
+            dq,
+            dk,
+            dv,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            ctx.max_seqlen_q,
+            ctx.max_seqlen_k,
+            ctx.dropout_p,
+            ctx.softmax_scale,
+            ctx.causal,
+            ctx.window_size,
+            ctx.softcap,
+            ctx.alibi_slopes,
+            ctx.deterministic,
+            rng_state=rng_state,
+        )
+        dq = dq[..., : dout.shape[-1]]  # We could have padded the head dimension
+        dk = dk[..., : dout.shape[-1]]
+        dv = dv[..., : dout.shape[-1]]
+        return dq, dk, dv, None, None, None, None, None, None, None, None, None, None, None, None, None
+
+
+def flash_attn_qkvpacked_func(
+    qkv,
+    dropout_p=0.0,
+    softmax_scale=None,
+    causal=False,
+    window_size=(-1, -1),  # -1 means infinite context window
+    softcap=0.0,  # <=0.0 means deactivate
+    alibi_slopes=None,
+    deterministic=False,
+    return_attn_probs=False,
+    *,
+    out=None,
+):
+    """dropout_p should be set to 0.0 during evaluation
+    If Q, K, V are already stacked into 1 tensor, this function will be faster than
+    calling flash_attn_func on Q, K, V since the backward pass avoids explicit concatenation
+    of the gradients of Q, K, V.
+    For multi-query and grouped-query attention (MQA/GQA), please see
+    flash_attn_kvpacked_func and flash_attn_func.
+
+    If window_size != (-1, -1), implements sliding window local attention. Query at position i
+    will only attend to keys between [i - window_size[0], i + window_size[1]] inclusive.
+
+    Arguments:
+        qkv: (batch_size, seqlen, 3, nheads, headdim)
+        dropout_p: float. Dropout probability.
+        softmax_scale: float. The scaling of QK^T before applying softmax.
+            Default to 1 / sqrt(headdim).
+        causal: bool. Whether to apply causal attention mask (e.g., for auto-regressive modeling).
+        window_size: (left, right). If not (-1, -1), implements sliding window local attention.
+        softcap: float. Anything > 0 activates softcapping attention.
+        alibi_slopes: (nheads,) or (batch_size, nheads), fp32. A bias of (-alibi_slope * |i - j|) is added to
+            the attention score of query i and key j.
+        deterministic: bool. Whether to use the deterministic implementation of the backward pass,
+            which is slightly slower and uses more memory. The forward pass is always deterministic.
+        return_attn_probs: bool. Whether to return the attention probabilities. This option is for
+           testing only. The returned probabilities are not guaranteed to be correct
+           (they might not have the right scaling).
+    Return:
+        out: (batch_size, seqlen, nheads, headdim).
+        softmax_lse [optional, if return_attn_probs=True]: (batch_size, nheads, seqlen). The
+            logsumexp of each row of the matrix QK^T * scaling (e.g., log of the softmax
+            normalization factor).
+        S_dmask [optional, if return_attn_probs=True]: (batch_size, nheads, seqlen, seqlen).
+            The output of softmax (possibly with different scaling). It also encodes the dropout
+            pattern (negative means that location was dropped, nonnegative means it was kept).
+    """
+    return FlashAttnQKVPackedFunc.apply(
+        qkv,
+        dropout_p,
+        softmax_scale,
+        causal,
+        window_size,
+        softcap,
+        alibi_slopes,
+        deterministic,
+        return_attn_probs,
+        out,
+    )
+
+
+def flash_attn_kvpacked_func(
+    q,
+    kv,
+    dropout_p=0.0,
+    softmax_scale=None,
+    causal=False,
+    window_size=(-1, -1),  # -1 means infinite context window
+    softcap=0.0,  # 0.0 means deactivated
+    alibi_slopes=None,
+    deterministic=False,
+    return_attn_probs=False,
+    *,
+    out=None,
+):
+    """dropout_p should be set to 0.0 during evaluation
+    If K, V are already stacked into 1 tensor, this function will be faster than
+    calling flash_attn_func on Q, K, V since the backward pass avoids explicit concatenation
+    of the gradients of K, V.
+    Supports multi-query and grouped-query attention (MQA/GQA) by passing in KV with fewer heads
+    than Q. Note that the number of heads in Q must be divisible by the number of heads in KV.
+    For example, if Q has 6 heads and K, V have 2 heads, head 0, 1, 2 of Q will attention to head
+    0 of K, V, and head 3, 4, 5 of Q will attention to head 1 of K, V.
+
+    If causal=True, the causal mask is aligned to the bottom right corner of the attention matrix.
+    For example, if seqlen_q = 2 and seqlen_k = 5, the causal mask (1 = keep, 0 = masked out) is:
+        1 1 1 1 0
+        1 1 1 1 1
+    If seqlen_q = 5 and seqlen_k = 2, the causal mask is:
+        0 0
+        0 0
+        0 0
+        1 0
+        1 1
+    If the row of the mask is all zero, the output will be zero.
+
+    If window_size != (-1, -1), implements sliding window local attention. Query at position i
+    will only attend to keys between
+    [i + seqlen_k - seqlen_q - window_size[0], i + seqlen_k - seqlen_q + window_size[1]] inclusive.
+
+    Arguments:
+        q: (batch_size, seqlen, nheads, headdim)
+        kv: (batch_size, seqlen, 2, nheads_k, headdim)
+        dropout_p: float. Dropout probability.
+        softmax_scale: float. The scaling of QK^T before applying softmax.
+            Default to 1 / sqrt(headdim).
+        causal: bool. Whether to apply causal attention mask (e.g., for auto-regressive modeling).
+        window_size: (left, right). If not (-1, -1), implements sliding window local attention.
+        softcap: float. Anything > 0 activates softcapping attention.
+        alibi_slopes: (nheads,) or (batch_size, nheads), fp32. A bias of
+            (-alibi_slope * |i + seqlen_k - seqlen_q - j|)
+            is added to the attention score of query i and key j.
+        deterministic: bool. Whether to use the deterministic implementation of the backward pass,
+            which is slightly slower and uses more memory. The forward pass is always deterministic.
+        return_attn_probs: bool. Whether to return the attention probabilities. This option is for
+           testing only. The returned probabilities are not guaranteed to be correct
+           (they might not have the right scaling).
+    Return:
+        out: (batch_size, seqlen, nheads, headdim).
+        softmax_lse [optional, if return_attn_probs=True]: (batch_size, nheads, seqlen). The
+            logsumexp of each row of the matrix QK^T * scaling (e.g., log of the softmax
+            normalization factor).
+        S_dmask [optional, if return_attn_probs=True]: (batch_size, nheads, seqlen, seqlen).
+            The output of softmax (possibly with different scaling). It also encodes the dropout
+            pattern (negative means that location was dropped, nonnegative means it was kept).
+    """
+    return FlashAttnKVPackedFunc.apply(
+        q,
+        kv,
+        dropout_p,
+        softmax_scale,
+        causal,
+        window_size,
+        softcap,
+        alibi_slopes,
+        deterministic,
+        return_attn_probs,
+        out,
+    )
+
+
+def flash_attn_func(
+    q,
+    k,
+    v,
+    dropout_p=0.0,
+    softmax_scale=None,
+    causal=False,
+    window_size=(-1, -1),  # -1 means infinite context window
+    softcap=0.0, # 0.0 means deactivated
+    alibi_slopes=None,
+    deterministic=False,
+    return_attn_probs=False,
+    *,
+    out=None,
+):
+    """dropout_p should be set to 0.0 during evaluation
+    Supports multi-query and grouped-query attention (MQA/GQA) by passing in KV with fewer heads
+    than Q. Note that the number of heads in Q must be divisible by the number of heads in KV.
+    For example, if Q has 6 heads and K, V have 2 heads, head 0, 1, 2 of Q will attention to head
+    0 of K, V, and head 3, 4, 5 of Q will attention to head 1 of K, V.
+
+    If causal=True, the causal mask is aligned to the bottom right corner of the attention matrix.
+    For example, if seqlen_q = 2 and seqlen_k = 5, the causal mask (1 = keep, 0 = masked out) is:
+        1 1 1 1 0
+        1 1 1 1 1
+    If seqlen_q = 5 and seqlen_k = 2, the causal mask is:
+        0 0
+        0 0
+        0 0
+        1 0
+        1 1
+    If the row of the mask is all zero, the output will be zero.
+
+    If window_size != (-1, -1), implements sliding window local attention. Query at position i
+    will only attend to keys between
+    [i + seqlen_k - seqlen_q - window_size[0], i + seqlen_k - seqlen_q + window_size[1]] inclusive.
+
+    Arguments:
+        q: (batch_size, seqlen, nheads, headdim)
+        k: (batch_size, seqlen, nheads_k, headdim)
+        v: (batch_size, seqlen, nheads_k, headdim)
+        dropout_p: float. Dropout probability.
+        softmax_scale: float. The scaling of QK^T before applying softmax.
+            Default to 1 / sqrt(headdim).
+        causal: bool. Whether to apply causal attention mask (e.g., for auto-regressive modeling).
+        window_size: (left, right). If not (-1, -1), implements sliding window local attention.
+        alibi_slopes: (nheads,) or (batch_size, nheads), fp32. A bias of
+            (-alibi_slope * |i + seqlen_k - seqlen_q - j|)
+            is added to the attention score of query i and key j.
+        deterministic: bool. Whether to use the deterministic implementation of the backward pass,
+            which is slightly slower and uses more memory. The forward pass is always deterministic.
+        return_attn_probs: bool. Whether to return the attention probabilities. This option is for
+           testing only. The returned probabilities are not guaranteed to be correct
+           (they might not have the right scaling).
+    Return:
+        out: (batch_size, seqlen, nheads, headdim).
+        softmax_lse [optional, if return_attn_probs=True]: (batch_size, nheads, seqlen). The
+            logsumexp of each row of the matrix QK^T * scaling (e.g., log of the softmax
+            normalization factor).
+        S_dmask [optional, if return_attn_probs=True]: (batch_size, nheads, seqlen, seqlen).
+            The output of softmax (possibly with different scaling). It also encodes the dropout
+            pattern (negative means that location was dropped, nonnegative means it was kept).
+    """
+    return FlashAttnFunc.apply(
+        q,
+        k,
+        v,
+        dropout_p,
+        softmax_scale,
+        causal,
+        window_size,
+        softcap,
+        alibi_slopes,
+        deterministic,
+        return_attn_probs,
+        out,
+    )
+
+
+def flash_attn_varlen_qkvpacked_func(
+    qkv,
+    cu_seqlens,
+    max_seqlen,
+    dropout_p=0.0,
+    softmax_scale=None,
+    causal=False,
+    window_size=(-1, -1),  # -1 means infinite context window
+    softcap=0.0, # 0.0 means deactivated
+    alibi_slopes=None,
+    deterministic=False,
+    return_attn_probs=False,
+    *,
+    out=None,
+):
+    """dropout_p should be set to 0.0 during evaluation
+    If Q, K, V are already stacked into 1 tensor, this function will be faster than
+    calling flash_attn_varlen_func on Q, K, V since the backward pass avoids explicit concatenation
+    of the gradients of Q, K, V.
+    For multi-query and grouped-query attention (MQA/GQA), please see
+    flash_attn_varlen_kvpacked_func and flash_attn_varlen_func.
+
+    If window_size != (-1, -1), implements sliding window local attention. Query at position i
+    will only attend to keys between [i - window_size[0], i + window_size[1]] inclusive.
+
+    Arguments:
+        qkv: (total, 3, nheads, headdim), where total = total number of tokens in the batch.
+        cu_seqlens: (batch_size + 1,), dtype torch.int32. The cumulative sequence lengths
+           of the sequences in the batch, used to index into qkv.
+        max_seqlen: int. Maximum sequence length in the batch.
+        dropout_p: float. Dropout probability.
+        softmax_scale: float. The scaling of QK^T before applying softmax.
+            Default to 1 / sqrt(headdim).
+        causal: bool. Whether to apply causal attention mask (e.g., for auto-regressive modeling).
+        window_size: (left, right). If not (-1, -1), implements sliding window local attention.
+        softcap: float. Anything > 0 activates softcapping attention.
+        alibi_slopes: (nheads,) or (batch_size, nheads), fp32. A bias of (-alibi_slope * |i - j|)
+            is added to the attention score of query i and key j.
+        deterministic: bool. Whether to use the deterministic implementation of the backward pass,
+            which is slightly slower and uses more memory. The forward pass is always deterministic.
+        return_attn_probs: bool. Whether to return the attention probabilities. This option is for
+           testing only. The returned probabilities are not guaranteed to be correct
+           (they might not have the right scaling).
+    Return:
+        out: (total, nheads, headdim).
+        softmax_lse [optional, if return_attn_probs=True]: (nheads, total_q_seqlen). The
+            logsumexp of each row of the matrix QK^T * scaling (e.g., log of the softmax
+            normalization factor).
+        S_dmask [optional, if return_attn_probs=True]: (batch_size, nheads, seqlen, seqlen).
+            The output of softmax (possibly with different scaling). It also encodes the dropout
+            pattern (negative means that location was dropped, nonnegative means it was kept).
+    """
+    return FlashAttnVarlenQKVPackedFunc.apply(
+        qkv,
+        cu_seqlens,
+        max_seqlen,
+        dropout_p,
+        softmax_scale,
+        causal,
+        window_size,
+        softcap,
+        alibi_slopes,
+        deterministic,
+        return_attn_probs,
+        out,
+    )
+
+
+def flash_attn_varlen_kvpacked_func(
+    q,
+    kv,
+    cu_seqlens_q,
+    cu_seqlens_k,
+    max_seqlen_q,
+    max_seqlen_k,
+    dropout_p=0.0,
+    softmax_scale=None,
+    causal=False,
+    window_size=(-1, -1),  # -1 means infinite context window
+    softcap=0.0, # 0.0 means deactivated
+    alibi_slopes=None,
+    deterministic=False,
+    return_attn_probs=False,
+    *,
+    out=None,
+):
+    """dropout_p should be set to 0.0 during evaluation
+    If K, V are already stacked into 1 tensor, this function will be faster than
+    calling flash_attn_func on Q, K, V since the backward pass avoids explicit concatenation
+    of the gradients of K, V.
+    Supports multi-query and grouped-query attention (MQA/GQA) by passing in KV with fewer heads
+    than Q. Note that the number of heads in Q must be divisible by the number of heads in KV.
+    For example, if Q has 6 heads and K, V have 2 heads, head 0, 1, 2 of Q will attention to head
+    0 of K, V, and head 3, 4, 5 of Q will attention to head 1 of K, V.
+
+    If causal=True, the causal mask is aligned to the bottom right corner of the attention matrix.
+    For example, if seqlen_q = 2 and seqlen_k = 5, the causal mask (1 = keep, 0 = masked out) is:
+        1 1 1 1 0
+        1 1 1 1 1
+    If seqlen_q = 5 and seqlen_k = 2, the causal mask is:
+        0 0
+        0 0
+        0 0
+        1 0
+        1 1
+    If the row of the mask is all zero, the output will be zero.
+
+    If window_size != (-1, -1), implements sliding window local attention. Query at position i
+    will only attend to keys between
+    [i + seqlen_k - seqlen_q - window_size[0], i + seqlen_k - seqlen_q + window_size[1]] inclusive.
+
+    Arguments:
+        q: (total_q, nheads, headdim), where total_q = total number of query tokens in the batch.
+        kv: (total_k, 2, nheads_k, headdim), where total_k = total number of key tokens in the batch.
+        cu_seqlens_q: (batch_size + 1,), dtype torch.int32. The cumulative sequence lengths
+           of the sequences in the batch, used to index into q.
+        cu_seqlens_k: (batch_size + 1,), dtype torch.int32. The cumulative sequence lengths
+           of the sequences in the batch, used to index into kv.
+        max_seqlen_q: int. Maximum query sequence length in the batch.
+        max_seqlen_k: int. Maximum key sequence length in the batch.
+        dropout_p: float. Dropout probability.
+        softmax_scale: float. The scaling of QK^T before applying softmax.
+            Default to 1 / sqrt(headdim).
+        causal: bool. Whether to apply causal attention mask (e.g., for auto-regressive modeling).
+        window_size: (left, right). If not (-1, -1), implements sliding window local attention.
+        softcap: float. Anything > 0 activates softcapping attention.
+        alibi_slopes: (nheads,) or (batch_size, nheads), fp32. A bias of
+            (-alibi_slope * |i + seqlen_k - seqlen_q - j|)
+            is added to the attention score of query i and key j.
+        deterministic: bool. Whether to use the deterministic implementation of the backward pass,
+            which is slightly slower and uses more memory. The forward pass is always deterministic.
+        return_attn_probs: bool. Whether to return the attention probabilities. This option is for
+           testing only. The returned probabilities are not guaranteed to be correct
+           (they might not have the right scaling).
+    Return:
+        out: (total, nheads, headdim).
+        softmax_lse [optional, if return_attn_probs=True]: (nheads, total_q_seqlen). The
+            logsumexp of each row of the matrix QK^T * scaling (e.g., log of the softmax
+            normalization factor).
+        S_dmask [optional, if return_attn_probs=True]: (batch_size, nheads, seqlen, seqlen).
+            The output of softmax (possibly with different scaling). It also encodes the dropout
+            pattern (negative means that location was dropped, nonnegative means it was kept).
+    """
+    return FlashAttnVarlenKVPackedFunc.apply(
+        q,
+        kv,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        max_seqlen_q,
+        max_seqlen_k,
+        dropout_p,
+        softmax_scale,
+        causal,
+        window_size,
+        softcap,
+        alibi_slopes,
+        deterministic,
+        return_attn_probs,
+        out,
+    )
 
 
 def flash_attn_varlen_func(
     q,
     k,
     v,
-    max_seqlen_q,
     cu_seqlens_q,
+    cu_seqlens_k,
+    max_seqlen_q,
     max_seqlen_k,
-    cu_seqlens_k=None, # only used for non-paged prefill
-    seqused_k=None,
     dropout_p=0.0,
     softmax_scale=None,
     causal=False,
-    window_size: Optional[List[int]] = None,
+    window_size=(-1, -1),  # -1 means infinite context window
     softcap=0.0, # 0.0 means deactivated
     alibi_slopes=None,
     deterministic=False,
     return_attn_probs=False,
     block_table=None,
     *,
-    return_softmax_lse=False,
     out=None,
-    fa_version: int = DEFAULT_FA_VERSION,
 ):
     """dropout_p should be set to 0.0 during evaluation
     Supports multi-query and grouped-query attention (MQA/GQA) by passing in K, V with fewer heads
@@ -144,82 +1145,32 @@ def flash_attn_varlen_func(
            (they might not have the right scaling).
     Return:
         out: (total, nheads, headdim).
-        softmax_lse [optional, if return_softmax_lse=True]: (nheads, total_q_seqlen). The
+        softmax_lse [optional, if return_attn_probs=True]: (nheads, total_q_seqlen). The
             logsumexp of each row of the matrix QK^T * scaling (e.g., log of the softmax
             normalization factor).
+        S_dmask [optional, if return_attn_probs=True]: (batch_size, nheads, seqlen, seqlen).
+            The output of softmax (possibly with different scaling). It also encodes the dropout
+            pattern (negative means that location was dropped, nonnegative means it was kept).
     """
-    assert cu_seqlens_k is not None or seqused_k is not None, \
-        "cu_seqlens_k or seqused_k must be provided"
-    assert cu_seqlens_k is None or seqused_k is None, \
-        "cu_seqlens_k and seqused_k cannot be provided at the same time"
-    assert block_table is None or seqused_k is not None, \
-        "seqused_k must be provided if block_table is provided"
-    
-    if softmax_scale is None:
-        softmax_scale = q.shape[-1] ** (-0.5)
-    # custom op does not support non-tuple input
-    real_window_size: Tuple[int, int]
-    if window_size is None:
-        real_window_size = (-1, -1)
-    else:
-        assert len(window_size) == 2
-        real_window_size = (window_size[0], window_size[1])
-    q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
-    
-    dummy_cu_seqlens_k = torch.empty_like(cu_seqlens_q)
-    
-    if fa_version == 2:
-        out, softmax_lse = torch.ops._vllm_fa2_C.varlen_fwd(
-            q, k, v,
-            out,
-            cu_seqlens_q,
-            # cu_seqlens_k not used since we use seqused_k, but flash_api.cpp 
-            # still wants it so we pass all zeros
-            dummy_cu_seqlens_k if cu_seqlens_k is None else cu_seqlens_k,
-            seqused_k,
-            None,
-            block_table,
-            alibi_slopes,
-            max_seqlen_q,
-            max_seqlen_k,
-            dropout_p,
-            softmax_scale,
-            False,
-            causal,
-            real_window_size[0],
-            real_window_size[1],
-            softcap,
-            return_softmax_lse and dropout_p > 0,
-            None,
-        )
-    elif fa_version == 3:
-        out, softmax_lse, _, _ = torch.ops._vllm_fa3_C.fwd(
-            q, k, v,
-            None, None,       # k_new, v_new
-            out,
-            cu_seqlens_q,
-            cu_seqlens_k,     # cu_seqlens_k
-            None,             # cu_seqlens_k_new
-            None, seqused_k,  # seqused_q, seqused_k
-            max_seqlen_q, max_seqlen_k,
-            block_table,
-            alibi_slopes,
-            None,             # kv_batch_idx
-            None, None,       # rotary_cos, rotary_sin
-            None, None, None, # q_descale, k_descale, v_descale
-            softmax_scale,
-            causal,
-            real_window_size[0], real_window_size[1],
-            0,                # sink_token_length
-            softcap,
-            True,             # rotary_interleaved
-            0,                # num_splits
-            None,             # pack_gqa
-            0,                # sm_margin
-        )
-    else:
-        raise ValueError(f"Unsupported FA version: {fa_version}")
-    return (out, softmax_lse) if return_softmax_lse else out
+    return FlashAttnVarlenFunc.apply(
+        q,
+        k,
+        v,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        max_seqlen_q,
+        max_seqlen_k,
+        dropout_p,
+        softmax_scale,
+        causal,
+        window_size,
+        softcap,
+        alibi_slopes,
+        deterministic,
+        return_attn_probs,
+        block_table,
+        out,
+    )
 
 
 def flash_attn_with_kvcache(
@@ -232,7 +1183,6 @@ def flash_attn_with_kvcache(
     rotary_sin=None,
     cache_seqlens: Optional[Union[(int, torch.Tensor)]] = None,
     cache_batch_idx: Optional[torch.Tensor] = None,
-    cache_leftpad: Optional[torch.Tensor] = None,
     block_table: Optional[torch.Tensor] = None,
     softmax_scale=None,
     causal=False,
@@ -244,7 +1194,6 @@ def flash_attn_with_kvcache(
     return_softmax_lse=False,
     *,
     out=None,
-    fa_version: int = DEFAULT_FA_VERSION,
 ):
     """
     If k and v are not None, k_cache and v_cache will be updated *inplace* with the new values from
@@ -344,218 +1293,25 @@ def flash_attn_with_kvcache(
         cache_seqlens = maybe_contiguous(cache_seqlens)
     cache_batch_idx = maybe_contiguous(cache_batch_idx)
     block_table = maybe_contiguous(block_table)
-    
-    if fa_version == 2:
-        out, softmax_lse = torch.ops._vllm_fa2_C.fwd_kvcache(
-            q, k_cache, v_cache,
-            k, v,             # k_new, v_new
-            cache_seqlens,
-            rotary_cos,
-            rotary_sin,
-            cache_batch_idx,
-            cache_leftpad,
-            block_table,
-            alibi_slopes,
-            out,
-            softmax_scale,
-            causal,
-            window_size[0],
-            window_size[1],
-            softcap,
-            rotary_interleaved,
-            num_splits,
-        )
-    elif fa_version == 3:
-        out, softmax_lse, _, _ = torch.ops._vllm_fa3_C.fwd(
-            q, k_cache, v_cache, # q, k, v
-            k, v,             # k_new, v_new
-            out,
-            None, None,       # cu_seqlens_q, cu_seqlens_k
-            None,             # cu_seqlens_k_new
-            None, cache_seqlens, # seqused_q, seqused_k
-            None, None,       # max_seqlen_q, max_seqlen_k
-            block_table,
-            alibi_slopes,
-            cache_batch_idx,  # kv_batch_idx
-            None, None,       # rotary_cos, rotary_sin
-            None, None, None, # q_descale, k_descale, v_descale
-            softmax_scale,
-            causal,
-            window_size[0], window_size[1],
-            0,                # sink_token_length
-            softcap,
-            True,             # rotary_interleaved
-            num_splits,       # num_splits
-            None,             # pack_gqa
-            0,                # sm_margin
-        )
-    else:
-        raise ValueError(f"Unsupported FA version: {fa_version}")
-    return (out, softmax_lse) if return_softmax_lse else out
-
-
-def sparse_attn_func(
-    q,
-    k,
-    v,
-    block_count,
-    block_offset,
-    column_count,
-    column_index,
-    dropout_p=0.0,
-    softmax_scale=None,
-    causal=False,
-    softcap=0.0, # 0.0 means deactivated
-    alibi_slopes=None,
-    deterministic=False,
-    return_attn_probs=False,
-    *,
-    return_softmax_lse=False,
-    out=None,
-):
-    """Compute attention with vertical and slash sparsity patterns.
-    Most Arguments are the same with the flash_attn_func interface, except for 4 extra args:
-    block_count and block_offset for slash sparsity patterns, and
-    column_count and column_index for vertical sparsity patterns.
-    For more details please refer to Appendix C.4.2 of paper https://arxiv.org/abs/2407.02490.
-
-    Arguments:
-        q: (batch_size, seqlen, nheads, headdim)
-        k: (batch_size, seqlen, nheads_k, headdim)
-        v: (batch_size, seqlen, nheads_k, headdim)
-        block_count: (batch_size, nheads, cdiv(seqlen, BLOCK_M))
-        block_offset: (batch_size, nheads, cdiv(seqlen, BLOCK_M), NNZ_S)
-        column_count: (batch_size, nheads, cdiv(seqlen, BLOCK_M))
-        column_index: (batch_size, nheads, cdiv(seqlen, BLOCK_M), NNZ_V)
-        dropout_p: float. Dropout probability.
-        softmax_scale: float. The scaling of QK^T before applying softmax.
-            Default to 1 / sqrt(headdim).
-        causal: bool. Whether to apply causal attention mask (e.g., for auto-regressive modeling).
-        alibi_slopes: (nheads,) or (batch_size, nheads), fp32. A bias of
-            (-alibi_slope * |i + seqlen_k - seqlen_q - j|)
-            is added to the attention score of query i and key j.
-        deterministic: bool. Whether to use the deterministic implementation of the backward pass,
-            which is slightly slower and uses more memory. The forward pass is always deterministic.
-        return_attn_probs: bool. Whether to return the attention probabilities. This option is for
-           testing only. The returned probabilities are not guaranteed to be correct
-           (they might not have the right scaling).
-    Return:
-        out: (batch_size, seqlen, nheads, headdim).
-        softmax_lse [optional, if return_softmax_lse=True]: (batch_size, nheads, seqlen). The
-            logsumexp of each row of the matrix QK^T * scaling (e.g., log of the softmax
-            normalization factor).
-    """
-    if softmax_scale is None:
-        softmax_scale = q.shape[-1] ** (-0.5)
-
-    q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
-    out, softmax_lse = torch.ops._vllm_fa2_C.fwd_sparse(
+    out, softmax_lse = torch.ops.vllm_flash_attn_c.fwd_kvcache(
         q,
+        k_cache,
+        v_cache,
         k,
         v,
-        block_count,
-        block_offset,
-        column_count,
-        column_index,
-        out,
+        cache_seqlens,
+        rotary_cos,
+        rotary_sin,
+        cache_batch_idx,
+        block_table,
         alibi_slopes,
-        dropout_p,
+        out,
         softmax_scale,
         causal,
+        window_size[0],
+        window_size[1],
         softcap,
-        return_attn_probs and dropout_p > 0,
-        None,
-    )
-    return (out, softmax_lse) if return_softmax_lse else out
-
-
-def sparse_attn_varlen_func(
-    q,
-    k,
-    v,
-    block_count,
-    block_offset,
-    column_count,
-    column_index,
-    cu_seqlens_q,
-    cu_seqlens_k,
-    max_seqlen_q,
-    max_seqlen_k,
-    dropout_p=0.0,
-    softmax_scale=None,
-    causal=False,
-    softcap=0.0, # 0.0 means deactivated
-    alibi_slopes=None,
-    deterministic=False,
-    return_attn_probs=False,
-    *,
-    return_softmax_lse=False,
-    out=None,
-):
-    """Compute attention with vertical and slash sparsity patterns.
-    Most Arguments are the same with the flash_attn_varlen_func interface, except for 4 extra args:
-    block_count and block_offset for slash sparsity patterns, and
-    column_count and column_index for vertical sparsity patterns.
-    For more details please refer to Appendix C.4.2 of paper https://arxiv.org/abs/2407.02490.
-    
-    Arguments:
-        q: (total_q, nheads, headdim), where total_q = total number of query tokens in the batch.
-        k: (total_k, nheads_k, headdim), where total_k = total number of key tokens in the batch.
-        v: (total_k, nheads_k, headdim), where total_k = total number of key tokens in the batch.
-        block_count: (batch_size, nheads, cdiv(seqlen, BLOCK_M))
-        block_offset: (batch_size, nheads, cdiv(seqlen, BLOCK_M), NNZ_S)
-        column_count: (batch_size, nheads, cdiv(seqlen, BLOCK_M))
-        column_index: (batch_size, nheads, cdiv(seqlen, BLOCK_M), NNZ_V)
-        cu_seqlens_q: (batch_size + 1,), dtype torch.int32. The cumulative sequence lengths
-           of the sequences in the batch, used to index into q.
-        cu_seqlens_k: (batch_size + 1,), dtype torch.int32. The cumulative sequence lengths
-           of the sequences in the batch, used to index into kv.
-        max_seqlen_q: int. Maximum query sequence length in the batch.
-        max_seqlen_k: int. Maximum key sequence length in the batch.
-        dropout_p: float. Dropout probability.
-        softmax_scale: float. The scaling of QK^T before applying softmax.
-            Default to 1 / sqrt(headdim).
-        causal: bool. Whether to apply causal attention mask (e.g., for auto-regressive modeling).
-        softcap: float. Anything > 0 activates softcapping attention.
-        alibi_slopes: (nheads,) or (batch_size, nheads), fp32. A bias of
-            (-alibi_slope * |i + seqlen_k - seqlen_q - j|)
-            is added to the attention score of query i and key j.
-        deterministic: bool. Whether to use the deterministic implementation of the backward pass,
-            which is slightly slower and uses more memory. The forward pass is always deterministic.
-        return_attn_probs: bool. Whether to return the attention probabilities. This option is for
-           testing only. The returned probabilities are not guaranteed to be correct
-           (they might not have the right scaling).
-    Return:
-        out: (total, nheads, headdim).
-        softmax_lse [optional, if return_softmax_lse=True]: (nheads, total_q_seqlen). The
-            logsumexp of each row of the matrix QK^T * scaling (e.g., log of the softmax
-            normalization factor).
-    """
-    if softmax_scale is None:
-        softmax_scale = q.shape[-1] ** (-0.5)
-        
-    q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
-    out, softmax_lse = torch.ops._vllm_fa2_C.varlen_fwd_sparse(
-        q,
-        k,
-        v,
-        block_count,
-        block_offset,
-        column_count,
-        column_index,
-        out,
-        cu_seqlens_q,
-        cu_seqlens_k,
-        None,
-        alibi_slopes,
-        max_seqlen_q,
-        max_seqlen_k,
-        dropout_p,
-        softmax_scale,
-        False,
-        causal,
-        softcap,
-        return_attn_probs and dropout_p > 0,
-        None,
+        rotary_interleaved,
+        num_splits,
     )
     return (out, softmax_lse) if return_softmax_lse else out

@@ -352,11 +352,11 @@ class LoRAModelManager(AdapterModelManager):
 
     @property
     def capacity(self) -> int:
-        return self.lora_config.max_cpu_loras + self.lora_config.prefetch_num
+        return self.lora_config.max_cpu_loras
 
     @property
     def lora_slots(self) -> int:
-        return self.lora_config.max_loras + self.lora_config.prefetch_num
+        return self.lora_config.max_loras
 
     @property
     def adapter_slots(self) -> int:

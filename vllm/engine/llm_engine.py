@@ -18,7 +18,7 @@ from vllm.config import (CacheConfig, DecodingConfig, DeviceConfig,
                          PromptAdapterConfig, SchedulerConfig,
                          SpeculativeConfig)
 from vllm.core.scheduler import (ScheduledSequenceGroup, Scheduler,
-                                 SchedulerOutputs)
+                                 SchedulerOutputs, NextSequenceGroup)
 from vllm.engine.arg_utils import EngineArgs
 from vllm.engine.metrics_types import StatLoggerBase, Stats
 from vllm.engine.output_processor.interfaces import (
@@ -1323,6 +1323,7 @@ class LLMEngine:
         seq_group_metadata_list = cached_outputs.seq_group_metadata_list
         scheduler_outputs = cached_outputs.scheduler_outputs
         allow_async_output_proc = cached_outputs.allow_async_output_proc
+        next_group_metadata_list: Optional[List[NextSequenceGroup]] = None
 
         ctx = self.scheduler_contexts[virtual_engine]
 

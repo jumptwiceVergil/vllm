@@ -723,7 +723,7 @@ class Scheduler:
                 assert curr_loras is not None
                 assert self.lora_config is not None
                 if (lora_int_id > 0 and (lora_int_id not in curr_loras)
-                        and len(curr_loras) >= self.lora_config.max_loras):
+                        and len(curr_loras) >= self.lora_config.max_loras - self.lora_config.prefetch_num):
                     # We don't have a space for another LoRA, so
                     # we ignore this request for now.
                     leftover_swapped.appendleft(seq_group)
@@ -947,7 +947,7 @@ class Scheduler:
                 assert self.lora_config is not None
                 if (self.lora_enabled and lora_int_id > 0
                         and lora_int_id not in curr_loras
-                        and len(curr_loras) >= self.lora_config.max_loras):
+                        and len(curr_loras) >= self.lora_config.max_loras - self.lora_config.prefetch_num):
                     # We don't have a space for another LoRA, so
                     # we ignore this request for now.
                     leftover_waiting_sequences.appendleft(seq_group)
@@ -1081,6 +1081,7 @@ class Scheduler:
             next_seq_groups = [seq for seq in self.ready]
         else:
             next_seq_groups = None
+            assert len(self.ready) == 0
 
         # Merge lists
         num_prefill_groups = len(prefills.seq_groups)
@@ -1358,8 +1359,8 @@ class Scheduler:
                 allow_async_output_proc = self._allow_async_output_proc(
                     seq_group)
         
+        next_group_metadata_list: Optional[List[NextGroupMetadata]] = []
         if scheduler_outputs.next_seq_groups is not None:
-            next_group_metadata_list: List[NextGroupMetadata] = []
             for next_seq_group in scheduler_outputs.next_seq_groups:
                 next_group_metadata = NextGroupMetadata(
                     request_id=next_seq_group.request_id,
